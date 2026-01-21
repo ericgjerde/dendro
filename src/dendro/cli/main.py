@@ -166,7 +166,7 @@ def measure(image: str, dpi: int, output: Optional[str], auto: bool):
 
 
 @cli.command()
-@click.argument("measurements", type=click.Path(exists=True))
+@click.argument("measurements", type=click.Path(exists=True), nargs=-1, required=True)
 @click.option(
     "--reference", "-r",
     type=click.Path(exists=True),
@@ -212,8 +212,30 @@ def measure(image: str, dpi: int, output: Optional[str], auto: bool):
     default=10,
     help="Number of top matches to display."
 )
+@click.option(
+    "--plot", "-P",
+    is_flag=True,
+    default=False,
+    help="Generate diagnostic plots (saves PNG alongside output)."
+)
+@click.option(
+    "--cross-verify", "-X",
+    is_flag=True,
+    default=False,
+    help="Cross-verify multiple samples for consistency."
+)
+@click.option(
+    "--segments/--no-segments",
+    default=True,
+    help="Show segment-by-segment correlation analysis."
+)
+@click.option(
+    "--markers/--no-markers",
+    default=True,
+    help="Detect and display marker year matches."
+)
 def date(
-    measurements: str,
+    measurements: tuple[str, ...],
     reference: Optional[str],
     era_start: int,
     era_end: int,
@@ -222,47 +244,54 @@ def date(
     bark_edge: bool,
     output: Optional[str],
     top: int,
+    plot: bool,
+    cross_verify: bool,
+    segments: bool,
+    markers: bool,
 ):
     """
-    Cross-date a sample against reference chronologies.
+    Cross-date sample(s) against reference chronologies.
 
     Takes ring width measurements (CSV with 'width' column) and
     matches against downloaded ITRDB chronologies to determine
     the felling year.
 
-    Example:
-        dendro date sample.csv --era-start=1750 --era-end=1850 --bark-edge
+    Single sample mode:
+        dendro date sample.csv --era-start=1750 --era-end=1850
+
+    Multi-sample verification mode (recommended for confidence):
+        dendro date beam1.csv beam2.csv beam3.csv --cross-verify
     """
     import pandas as pd
     from ..crossdating.matcher import CrossdateMatcher
-    from ..crossdating.detrend import DetrendMethod
+    from ..crossdating.detrend import DetrendMethod, detrend_series, standardize
+    from ..crossdating.correlator import sliding_correlation
 
-    measurements_path = Path(measurements)
     reference_dir = Path(reference) if reference else DEFAULT_DATA_DIR / "reference"
 
-    # Load measurements
-    try:
-        if measurements_path.suffix.lower() == ".csv":
-            df = pd.read_csv(measurements_path)
-            if "width" in df.columns:
-                values = df["width"].values
-            elif "width_mm" in df.columns:
-                values = df["width_mm"].values
-            else:
-                # Try last numeric column
-                values = df.select_dtypes(include=[np.number]).iloc[:, -1].values
-        else:
-            # Try to parse as raw values
-            values = np.loadtxt(measurements_path)
-    except Exception as e:
-        click.echo(f"Error loading measurements: {e}", err=True)
-        sys.exit(1)
+    # Parse filters
+    species_filter = [s.strip().upper() for s in species.split(",")] if species else None
+    state_filter = [s.strip().upper() for s in states.split(",")] if states else None
 
-    click.echo(f"Loaded {len(values)} ring measurements")
-    click.echo(f"Reference directory: {reference_dir}")
-    click.echo(f"Search era: {era_start}-{era_end}")
-    click.echo(f"Bark edge: {'Yes' if bark_edge else 'No'}")
-    click.echo()
+    # Load all measurement files
+    all_samples = []
+    for mpath in measurements:
+        measurements_path = Path(mpath)
+        try:
+            if measurements_path.suffix.lower() == ".csv":
+                df = pd.read_csv(measurements_path)
+                if "width" in df.columns:
+                    values = df["width"].values
+                elif "width_mm" in df.columns:
+                    values = df["width_mm"].values
+                else:
+                    values = df.select_dtypes(include=[np.number]).iloc[:, -1].values
+            else:
+                values = np.loadtxt(measurements_path)
+            all_samples.append((measurements_path, values))
+        except Exception as e:
+            click.echo(f"Error loading {measurements_path}: {e}", err=True)
+            sys.exit(1)
 
     # Build matcher
     try:
@@ -270,18 +299,36 @@ def date(
         if len(matcher.index) == 0:
             click.echo("No reference chronologies found. Run 'dendro download' first.", err=True)
             sys.exit(1)
-
         click.echo(f"Loaded {len(matcher.index)} reference chronologies")
     except Exception as e:
         click.echo(f"Error loading references: {e}", err=True)
         sys.exit(1)
 
-    # Parse filters
-    species_filter = [s.strip().upper() for s in species.split(",")] if species else None
-    state_filter = [s.strip().upper() for s in states.split(",")] if states else None
+    # Multi-sample cross-verification mode
+    if cross_verify and len(all_samples) > 1:
+        _run_cross_verify(
+            samples=all_samples,
+            matcher=matcher,
+            species_filter=species_filter,
+            state_filter=state_filter,
+            era_start=era_start,
+            era_end=era_end,
+            bark_edge=bark_edge,
+            output=output,
+            plot=plot,
+        )
+        return
 
-    # Run cross-dating
-    click.echo("\nCross-dating...")
+    # Single sample mode (or first sample if not cross-verify)
+    measurements_path, values = all_samples[0]
+
+    click.echo(f"\nLoaded {len(values)} ring measurements from {measurements_path.name}")
+    click.echo(f"Reference directory: {reference_dir}")
+    click.echo(f"Search era: {era_start}-{era_end}")
+    click.echo(f"Bark edge: {'Yes' if bark_edge else 'No'}")
+    click.echo()
+
+    click.echo("Cross-dating...")
 
     report = matcher.date_sample(
         values=values,
@@ -308,10 +355,24 @@ def date(
     else:
         click.echo("No confident date could be determined.")
 
+    # Add stricter warnings for borderline t-values
+    if report.matches:
+        best = report.matches[0]
+        if 4.0 <= best.t_value < 5.0:
+            report.warnings.append(
+                f"CAUTION: Best t-value ({best.t_value:.1f}) is in borderline range (4-5). "
+                "This commonly produces spurious matches. Seek additional verification."
+            )
+        if best.t_value < 6.0 and report.consensus_confidence == "MEDIUM":
+            report.warnings.append(
+                "Professional standards recommend t≥6 for publication. "
+                "Consider longer sample or additional references."
+            )
+
     if report.warnings:
         click.echo("\nWarnings:")
         for w in report.warnings:
-            click.echo(f"  - {w}")
+            click.echo(f"  ⚠ {w}")
 
     if report.matches:
         click.echo(f"\nTop {min(top, len(report.matches))} matches:")
@@ -324,12 +385,29 @@ def date(
             click.echo(f"   Overlap: {m.overlap} years, Confidence: {m.confidence}")
             click.echo()
 
+        # Show segment analysis for best match
+        if segments and report.matches[0].segment_correlations:
+            _display_segment_analysis(report.matches[0], report.consensus_year)
+
+        # Detect and display marker years
+        if markers and report.consensus_year:
+            _display_marker_years(values, report.consensus_year)
+
     # Save results if requested
     if output:
         output_path = Path(output)
         with open(output_path, "w") as f:
             json.dump(report.to_dict(), f, indent=2)
-        click.echo(f"Results saved to {output_path}")
+        click.echo(f"\nResults saved to {output_path}")
+
+    # Generate plots if requested
+    if plot and report.matches:
+        _generate_plots(
+            report=report,
+            values=values,
+            matcher=matcher,
+            output_path=Path(output) if output else measurements_path.with_suffix(".png"),
+        )
 
 
 @cli.command()
@@ -440,6 +518,286 @@ def parse(rwl_file: str):
     except Exception as e:
         click.echo(f"Error parsing file: {e}", err=True)
         sys.exit(1)
+
+
+def _display_segment_analysis(match, consensus_year: int):
+    """Display segment-by-segment correlation analysis."""
+    click.echo("\nSegment Analysis (50-year windows):")
+    click.echo("-" * 60)
+
+    seg_corrs = match.segment_correlations
+    if not seg_corrs:
+        click.echo("  (Sample too short for segment analysis)")
+        return
+
+    weak_segments = []
+    for start_idx, r, t in seg_corrs:
+        year = match.proposed_start_year + start_idx
+        year_end = year + 50
+
+        # Determine quality indicator
+        if t >= 6.0:
+            quality = "+++"
+        elif t >= 4.0:
+            quality = "++ "
+        elif t >= 3.5:
+            quality = "+  "
+        else:
+            quality = "!  "
+            weak_segments.append((year, year_end, r, t))
+
+        click.echo(f"  {quality} {year}-{year_end}: r={r:.3f}, t={t:.1f}")
+
+    if weak_segments:
+        click.echo("\n  ⚠ Weak segments detected (t<3.5):")
+        for year, year_end, r, t in weak_segments:
+            click.echo(f"    {year}-{year_end}: Check measurements in this region")
+
+
+def _display_marker_years(values: np.ndarray, proposed_start_year: int):
+    """Detect and display potential marker year matches."""
+    from ..visualization.plots import detect_marker_years, identify_known_markers, MARKER_YEARS
+
+    click.echo("\nMarker Year Analysis:")
+    click.echo("-" * 60)
+
+    # Detect anomalous rings
+    anomalies = detect_marker_years(values, threshold_sigma=2.0)
+
+    if not anomalies:
+        click.echo("  No strongly anomalous rings detected.")
+        return
+
+    # Check against known marker years
+    matches = identify_known_markers(anomalies, proposed_start_year)
+
+    if matches:
+        click.echo("  Known climate events matched:")
+        for year, sample_desc, known_event in matches:
+            click.echo(f"  ✓ {year}: {known_event}")
+            click.echo(f"    (Sample shows {sample_desc})")
+        click.echo("\n  Marker year alignment strengthens confidence in dating.")
+    else:
+        click.echo("  Anomalous rings detected but no known markers matched:")
+        for idx, z_score, desc in anomalies[:5]:
+            year = proposed_start_year + idx
+            click.echo(f"    Ring at year {year}: {desc} (z={z_score:.1f})")
+
+    # Also show which marker years should be in the sample
+    sample_end = proposed_start_year + len(values) - 1
+    expected_markers = [
+        (y, desc) for y, desc in MARKER_YEARS.items()
+        if proposed_start_year <= y <= sample_end
+    ]
+
+    if expected_markers:
+        click.echo(f"\n  Expected marker years in sample range ({proposed_start_year}-{sample_end}):")
+        for year, desc in sorted(expected_markers):
+            idx = year - proposed_start_year
+            if 0 <= idx < len(values):
+                ring_val = values[idx]
+                mean = np.mean(values)
+                std = np.std(values)
+                z = (ring_val - mean) / std if std > 0 else 0
+                status = "✓ narrow" if z < -1.5 else "? not anomalous"
+                click.echo(f"    {year}: {desc}")
+                click.echo(f"       Ring value z-score: {z:.1f} ({status})")
+
+
+def _run_cross_verify(
+    samples: list[tuple[Path, np.ndarray]],
+    matcher,
+    species_filter,
+    state_filter,
+    era_start: int,
+    era_end: int,
+    bark_edge: bool,
+    output: Optional[str],
+    plot: bool,
+):
+    """Run cross-verification across multiple samples."""
+    click.echo("\n" + "=" * 60)
+    click.echo("MULTI-SAMPLE CROSS-VERIFICATION")
+    click.echo("=" * 60)
+    click.echo(f"Analyzing {len(samples)} samples for consistency...")
+    click.echo()
+
+    results = []
+    for path, values in samples:
+        report = matcher.date_sample(
+            values=values,
+            sample_name=path.stem,
+            has_bark_edge=bark_edge,
+            species_filter=species_filter,
+            state_filter=state_filter,
+            era_start=era_start,
+            era_end=era_end,
+        )
+        results.append((path, values, report))
+
+        # Brief summary per sample
+        if report.consensus_year:
+            click.echo(f"  {path.name}: {report.consensus_year} ({report.consensus_confidence})")
+        else:
+            click.echo(f"  {path.name}: No confident date")
+
+    click.echo()
+
+    # Check for consensus across samples
+    dated_results = [(p, v, r) for p, v, r in results if r.consensus_year]
+
+    if len(dated_results) < 2:
+        click.echo("⚠ Insufficient samples with confident dates for cross-verification.")
+        return
+
+    # Extract years from each sample
+    years = [r.consensus_year for _, _, r in dated_results]
+    unique_years = set(years)
+
+    click.echo("CROSS-VERIFICATION RESULTS")
+    click.echo("-" * 60)
+
+    if len(unique_years) == 1:
+        consensus_year = years[0]
+        click.echo(f"✓ STRONG AGREEMENT: All {len(dated_results)} samples date to {consensus_year}")
+        click.echo(f"  This significantly increases confidence in the dating.")
+
+        # Calculate combined statistics
+        total_t = sum(r.matches[0].t_value if r.matches else 0 for _, _, r in dated_results)
+        avg_t = total_t / len(dated_results)
+        click.echo(f"\n  Combined statistics:")
+        click.echo(f"    Samples agreeing: {len(dated_results)}/{len(results)}")
+        click.echo(f"    Average t-value: {avg_t:.1f}")
+
+    else:
+        click.echo("⚠ DISAGREEMENT DETECTED")
+        click.echo("  Samples propose different felling years:")
+        for year in sorted(unique_years):
+            agreeing = [p.name for p, _, r in dated_results if r.consensus_year == year]
+            click.echo(f"    {year}: {', '.join(agreeing)}")
+
+        click.echo("\n  Possible causes:")
+        click.echo("    - Samples from different trees/buildings")
+        click.echo("    - Missing rings in one or more samples")
+        click.echo("    - Measurement errors")
+        click.echo("    - One or more spurious matches")
+
+    # Geographic diversity check
+    if dated_results:
+        all_states = set()
+        for _, _, r in dated_results:
+            if r.matches:
+                for m in r.matches[:3]:
+                    all_states.add(m.reference_state)
+
+        if len(all_states) >= 3:
+            click.echo(f"\n✓ Geographic diversity: References from {len(all_states)} states agree")
+            click.echo(f"  States: {', '.join(sorted(all_states))}")
+
+    # Save combined results if requested
+    if output:
+        combined = {
+            "samples": [
+                {
+                    "name": p.name,
+                    "length": len(v),
+                    "consensus_year": r.consensus_year,
+                    "confidence": r.consensus_confidence,
+                    "top_match_t": r.matches[0].t_value if r.matches else None,
+                }
+                for p, v, r in results
+            ],
+            "cross_verification": {
+                "samples_agreeing": len([y for y in years if y == max(set(years), key=years.count)]),
+                "total_samples": len(results),
+                "unique_years_proposed": list(unique_years),
+                "agreement": len(unique_years) == 1,
+            }
+        }
+        output_path = Path(output)
+        with open(output_path, "w") as f:
+            json.dump(combined, f, indent=2)
+        click.echo(f"\nCombined results saved to {output_path}")
+
+
+def _generate_plots(report, values: np.ndarray, matcher, output_path: Path):
+    """Generate and save diagnostic plots."""
+    from ..crossdating.detrend import detrend_series, standardize
+    from ..crossdating.correlator import sliding_correlation
+    from ..visualization.plots import save_diagnostic_plots
+
+    if not report.matches:
+        click.echo("No matches to plot.")
+        return
+
+    best_match = report.matches[0]
+
+    # Get the reference data
+    candidates = matcher.index.search(
+        species=None,
+        states=None,
+        min_year=best_match.proposed_start_year - 100,
+        max_year=best_match.proposed_end_year + 100,
+        min_overlap=30,
+    )
+
+    # Find the matching reference
+    ref_data = None
+    ref_start = None
+
+    for meta in candidates:
+        if meta.site_name == best_match.reference_name:
+            data = matcher.index.load_chronology(meta)
+            if data is not None:
+                from ..reference.tucson_parser import Chronology, RWLFile
+
+                if isinstance(data, Chronology):
+                    ref_values = data.values
+                    ref_start = data.start_year
+                    if np.mean(ref_values) > 500:
+                        ref_data = ref_values / 1000.0
+                    else:
+                        ref_data = standardize(ref_values)
+                elif isinstance(data, RWLFile):
+                    df = data.to_dataframe()
+                    ref_values = df.mean(axis=1).values
+                    ref_start = int(df.index.min())
+                    try:
+                        detrended, _ = detrend_series(ref_values)
+                        ref_data = standardize(detrended)
+                    except Exception:
+                        ref_data = standardize(ref_values)
+                break
+
+    if ref_data is None or ref_start is None:
+        click.echo("Could not load reference for plotting.")
+        return
+
+    # Standardize sample
+    try:
+        detrended, _ = detrend_series(values)
+        sample_std = standardize(detrended)
+    except Exception:
+        sample_std = standardize(values)
+
+    # Get correlation profile
+    all_correlations = sliding_correlation(
+        sample_std, ref_data, ref_start, min_overlap=30
+    )
+
+    # Generate plots
+    plot_path = output_path.with_suffix(".png")
+
+    save_diagnostic_plots(
+        report=report,
+        sample=sample_std,
+        reference=ref_data,
+        reference_start_year=ref_start,
+        output_path=plot_path,
+        all_correlations=all_correlations,
+    )
+
+    click.echo(f"Diagnostic plots saved to {plot_path}")
 
 
 def main():

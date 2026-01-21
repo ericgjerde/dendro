@@ -379,6 +379,36 @@ class CrossdateMatcher:
                 "50+ rings recommended for reliable dating."
             )
 
+        # Stricter t-value warnings
+        if 4.0 <= best_match.t_value < 5.0:
+            report.warnings.append(
+                f"T-value ({best_match.t_value:.1f}) is in the borderline range (4-5). "
+                "This range commonly produces spurious matches in dendro dating."
+            )
+
+        if best_match.t_value < 6.0:
+            report.warnings.append(
+                "T-value below 6.0. Professional publication standards "
+                "typically require t≥6 for secure dating."
+            )
+
+        # Check segment consistency
+        if best_match.segment_correlations:
+            weak_segs = [s for s in best_match.segment_correlations if s[2] < 3.5]
+            if weak_segs:
+                report.warnings.append(
+                    f"{len(weak_segs)} segment(s) show weak correlation (t<3.5). "
+                    "Check measurements in these regions."
+                )
+
+        # Geographic diversity warning
+        states = set(m.reference_state for m in good_matches[:5])
+        if len(states) == 1:
+            report.warnings.append(
+                f"All top matches from single state ({list(states)[0]}). "
+                "Geographic diversity would strengthen confidence."
+            )
+
 
 def date_measurements(
     measurements: np.ndarray | pd.DataFrame,
