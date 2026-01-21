@@ -58,3 +58,6 @@ Thumbs.db
 *.jpg
 *.jpeg
 !tests/fixtures/*
+
+# Development workflow tracking
+.beads/
