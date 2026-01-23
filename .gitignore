@@ -61,3 +61,4 @@ Thumbs.db
 
 # Development workflow tracking
 .beads/
+uv.lock
