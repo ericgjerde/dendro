@@ -21,7 +21,11 @@ from dendro.reference.tucson_parser import parse_rwl_file
 from dendro.reference.chronology_index import ChronologyIndex
 from dendro.reference.metadata import resolve_reference_metadata
 from dendro.crossdating.matcher import CrossdateMatcher
-from dendro.crossdating.benchmark import sweep_corpus, summarize_corpus_results
+from dendro.crossdating.benchmark import (
+    DEFAULT_BENCHMARK_SLICES_PATH,
+    sweep_corpus,
+    summarize_corpus_results,
+)
 from dendro.crossdating.detrend import DetrendMethod
 
 
@@ -307,6 +311,7 @@ def run_corpus_analysis(
     output_json: str | None,
     top_n: int,
     workers: int,
+    benchmark_slices: str | None,
 ):
     """Run a structured sweep across the bundled corpus."""
     results = sweep_corpus(
@@ -316,13 +321,14 @@ def run_corpus_analysis(
         top_n=top_n,
         progress_every=50 if scope == "all" else 0,
         max_workers=workers,
+        slice_config_path=benchmark_slices,
     )
     payload = {
         "reference_dir": str(Path(reference_dir).resolve()),
         "scope": scope,
         "top_n": int(top_n),
         "results": [result.to_dict() for result in results],
-        "summary": summarize_corpus_results(results),
+        "summary": summarize_corpus_results(results, slice_config_path=benchmark_slices),
     }
 
     if output_json:
@@ -358,6 +364,20 @@ def run_corpus_analysis(
     for category, count in sorted(payload["summary"]["category_counts"].items()):
         print(f"  {category}: {count}")
     print()
+    slice_summary = payload["summary"].get("benchmark_slices", {})
+    if slice_summary.get("primary_slices") or slice_summary.get("overlays"):
+        print("Slice summaries:")
+        for slice_summary_item in slice_summary.get("primary_slices", []):
+            status = "targets met" if slice_summary_item.get("targets_met") else "targets unmet"
+            if slice_summary_item.get("targets_met") is None:
+                status = "no targets"
+            print(
+                f"  {slice_summary_item['id']}: {slice_summary_item['count']} cases, "
+                f"{status}"
+            )
+        for slice_summary_item in slice_summary.get("overlays", []):
+            print(f"  overlay {slice_summary_item['id']}: {slice_summary_item['count']} cases")
+        print()
     print("Top likely-cause labels:")
     for cause, count in sorted(
         payload["summary"]["likely_cause_counts"].items(),
@@ -405,6 +425,11 @@ if __name__ == "__main__":
         help="Write structured corpus sweep output to this JSON file",
     )
     parser.add_argument(
+        "--benchmark-slices",
+        default=str(DEFAULT_BENCHMARK_SLICES_PATH),
+        help="Benchmark slice taxonomy JSON file",
+    )
+    parser.add_argument(
         "--top-n",
         type=int,
         default=20,
@@ -436,6 +461,7 @@ if __name__ == "__main__":
             output_json=args.output_json,
             top_n=args.top_n,
             workers=args.workers,
+            benchmark_slices=args.benchmark_slices,
         )
         success = True
     elif args.suite_file:

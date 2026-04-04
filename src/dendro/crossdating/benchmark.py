@@ -7,6 +7,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from ..reference.tucson_parser import parse_rwl_file
 
 PASS_TOLERANCE_YEARS = 2
 NEAR_MISS_TOLERANCE_YEARS = 5
+DEFAULT_BENCHMARK_SLICES_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "benchmark_slices_v1.json"
 _WORKER_BASE_INDEX: Optional[ChronologyIndex] = None
 
 
@@ -74,6 +76,9 @@ class BenchmarkCaseResult:
     category: str = ""
     likely_causes: list[str] = field(default_factory=list)
     warning_count: int = 0
+    primary_slice_id: str = "unclassified"
+    overlay_ids: list[str] = field(default_factory=list)
+    primary_slice_matched: bool = False
 
     @property
     def top1_abs_error(self) -> Optional[int]:
@@ -103,7 +108,295 @@ class BenchmarkCaseResult:
             "category": self.category,
             "likely_causes": list(self.likely_causes),
             "warning_count": int(self.warning_count),
+            "benchmark_slices": {
+                "primary_slice_id": self.primary_slice_id,
+                "overlay_ids": list(self.overlay_ids),
+                "primary_slice_matched": bool(self.primary_slice_matched),
+            },
         }
+
+
+@dataclass(frozen=True)
+class BenchmarkSliceDefinition:
+    """Primary slice or overlay definition loaded from fixture metadata."""
+
+    id: str
+    description: str
+    inclusion: dict
+    targets: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BenchmarkSliceCatalog:
+    """Loaded benchmark slice taxonomy."""
+
+    source_path: str
+    primary_slices: tuple[BenchmarkSliceDefinition, ...]
+    overlays: tuple[BenchmarkSliceDefinition, ...]
+    taxonomy_order: tuple[str, ...]
+
+    @property
+    def primary_by_id(self) -> dict[str, BenchmarkSliceDefinition]:
+        return {slice_def.id: slice_def for slice_def in self.primary_slices}
+
+    @property
+    def overlay_by_id(self) -> dict[str, BenchmarkSliceDefinition]:
+        return {slice_def.id: slice_def for slice_def in self.overlays}
+
+
+def _default_slice_catalog_path() -> Path:
+    return DEFAULT_BENCHMARK_SLICES_PATH
+
+
+@lru_cache(maxsize=8)
+def _load_benchmark_slice_catalog_cached(path_str: str) -> BenchmarkSliceCatalog:
+    path = Path(path_str)
+    if not path.exists():
+        return BenchmarkSliceCatalog(
+            source_path=str(path),
+            primary_slices=(),
+            overlays=(),
+            taxonomy_order=(),
+        )
+
+    payload = json.loads(path.read_text())
+    primary_slices = tuple(
+        BenchmarkSliceDefinition(
+            id=str(item["id"]),
+            description=str(item.get("description", "")),
+            inclusion=dict(item.get("inclusion", {})),
+            targets=dict(item.get("targets", {})),
+        )
+        for item in payload.get("primary_slices", [])
+    )
+    overlays = tuple(
+        BenchmarkSliceDefinition(
+            id=str(item["id"]),
+            description=str(item.get("description", "")),
+            inclusion=dict(item.get("inclusion", {})),
+            targets=dict(item.get("targets", {})),
+        )
+        for item in payload.get("overlays", [])
+    )
+    taxonomy_order = tuple(str(item) for item in payload.get("taxonomy_order", []))
+    if not taxonomy_order:
+        taxonomy_order = tuple(slice_def.id for slice_def in primary_slices)
+
+    return BenchmarkSliceCatalog(
+        source_path=str(path),
+        primary_slices=primary_slices,
+        overlays=overlays,
+        taxonomy_order=taxonomy_order,
+    )
+
+
+def load_benchmark_slice_catalog(slice_config_path: Optional[str | Path] = None) -> BenchmarkSliceCatalog:
+    """Load the benchmark slice taxonomy, defaulting to the shipped fixture."""
+    if slice_config_path is None:
+        slice_config_path = _default_slice_catalog_path()
+    return _load_benchmark_slice_catalog_cached(str(Path(slice_config_path).resolve()))
+
+
+def _normalize_rule_values(values: object) -> set:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        return {values.upper()}
+    return {str(value).upper() for value in values}
+
+
+def _matches_benchmark_slice(
+    slice_def: BenchmarkSliceDefinition,
+    result: BenchmarkCaseResult,
+    *,
+    primary_slice_id: str | None = None,
+    respect_length: bool = True,
+) -> bool:
+    inclusion = slice_def.inclusion or {}
+    case = result.case
+    species = (case.species or "").upper()
+    state = (case.state or "").upper()
+    reference_count = int(result.reference_count)
+
+    if "exclude_slice_ids" in inclusion and primary_slice_id in _normalize_rule_values(inclusion.get("exclude_slice_ids")):
+        return False
+
+    allowlist = inclusion.get("species_state_allowlist")
+    if allowlist:
+        normalized_allowlist = {
+            (str(item[0]).upper(), str(item[1]).upper())
+            for item in allowlist
+            if isinstance(item, (list, tuple)) and len(item) >= 2
+        }
+        if (species, state) not in normalized_allowlist:
+            return False
+
+    species_any_of = _normalize_rule_values(inclusion.get("species_any_of"))
+    if species_any_of and species not in species_any_of:
+        return False
+
+    states_any_of = _normalize_rule_values(inclusion.get("states_any_of"))
+    if states_any_of and state not in states_any_of:
+        return False
+
+    min_length = inclusion.get("min_length")
+    if respect_length and min_length is not None and case.length < int(min_length):
+        return False
+
+    max_length = inclusion.get("max_length")
+    if max_length is not None and case.length > int(max_length):
+        return False
+
+    min_reference_count = inclusion.get("min_reference_count_after_exclusion")
+    if min_reference_count is not None and reference_count < int(min_reference_count):
+        return False
+
+    max_reference_count = inclusion.get("max_reference_count_after_exclusion")
+    if max_reference_count is not None and reference_count > int(max_reference_count):
+        return False
+
+    return True
+
+
+def assign_benchmark_slices(
+    result: BenchmarkCaseResult,
+    *,
+    slice_config_path: Optional[str | Path] = None,
+) -> BenchmarkCaseResult:
+    """Assign a primary slice and overlays to a benchmark result."""
+    catalog = load_benchmark_slice_catalog(slice_config_path)
+
+    primary_slice_id = "unclassified"
+    primary_slice_matched = False
+    ordered_primary_ids = [
+        slice_id
+        for slice_id in catalog.taxonomy_order
+        if slice_id in catalog.primary_by_id
+    ]
+    ordered_primary_ids.extend(
+        slice_def.id
+        for slice_def in catalog.primary_slices
+        if slice_def.id not in ordered_primary_ids
+    )
+
+    for slice_id in ordered_primary_ids:
+        slice_def = catalog.primary_by_id[slice_id]
+        if _matches_benchmark_slice(
+            slice_def,
+            result,
+            primary_slice_id=slice_id,
+            respect_length=False,
+        ):
+            primary_slice_id = slice_id
+            primary_slice_matched = True
+            break
+
+    overlay_ids = [
+        slice_def.id
+        for slice_def in catalog.overlays
+        if _matches_benchmark_slice(slice_def, result, primary_slice_id=primary_slice_id)
+    ]
+
+    result.primary_slice_id = primary_slice_id
+    result.primary_slice_matched = primary_slice_matched
+    result.overlay_ids = overlay_ids
+    return result
+
+
+def _result_group_summary(grouped_results: list[BenchmarkCaseResult]) -> dict:
+    count = len(grouped_results)
+    if count == 0:
+        return {"count": 0}
+
+    top1_passes = sum(1 for result in grouped_results if result.passed_top1)
+    top5_hits = sum(1 for result in grouped_results if result.correct_year_in_top5)
+    recommended = sum(1 for result in grouped_results if result.category == "correct_recommended")
+    recommended_outputs = sum(1 for result in grouped_results if result.status == "recommended")
+    no_matches = sum(1 for result in grouped_results if result.category == "no_match")
+    long_offsets = sum(1 for result in grouped_results if result.category == "long_offset_false_positive")
+    ranking_misses = sum(1 for result in grouped_results if result.category == "ranking_miss")
+    recommended_precision = (
+        round(recommended / recommended_outputs, 4)
+        if recommended_outputs > 0
+        else None
+    )
+
+    return {
+        "count": count,
+        "top1_within_2_years": top1_passes,
+        "top1_within_2_years_rate": round(top1_passes / count, 4),
+        "top5_within_2_years": top5_hits,
+        "top5_within_2_years_rate": round(top5_hits / count, 4),
+        "recommended": recommended,
+        "recommended_rate": round(recommended / count, 4),
+        "recommended_outputs": recommended_outputs,
+        "recommended_outputs_rate": round(recommended_outputs / count, 4),
+        "recommended_precision": recommended_precision,
+        "no_match": no_matches,
+        "no_match_rate": round(no_matches / count, 4),
+        "ranking_miss": ranking_misses,
+        "ranking_miss_rate": round(ranking_misses / count, 4),
+        "long_offset_false_positive": long_offsets,
+        "long_offset_false_positive_rate": round(long_offsets / count, 4),
+    }
+
+
+def _evaluate_target(summary: dict, target_key: str, target_value: float) -> dict:
+    metric_map = {
+        "top1_within_2_years_rate": ("top1_within_2_years_rate", "gte"),
+        "top5_within_2_years_rate": ("top5_within_2_years_rate", "gte"),
+        "long_offset_false_positive_rate": ("long_offset_false_positive_rate", "lte"),
+        "no_match_rate": ("no_match_rate", "lte"),
+        "recommended_precision": ("recommended_precision", "gte"),
+        "recommended_rate_max": ("recommended_outputs_rate", "lte"),
+    }
+    actual_key, comparison = metric_map.get(target_key, (target_key, "gte"))
+    actual_value = summary.get(actual_key)
+    passed = False
+    delta = None
+
+    if actual_value is not None:
+        actual_float = float(actual_value)
+        target_float = float(target_value)
+        if comparison == "lte":
+            passed = actual_float <= target_float
+            delta = round(target_float - actual_float, 4)
+        else:
+            passed = actual_float >= target_float
+            delta = round(actual_float - target_float, 4)
+
+    return {
+        "metric": actual_key,
+        "comparison": comparison,
+        "target": float(target_value),
+        "actual": actual_value,
+        "passed": bool(passed),
+        "delta": delta,
+    }
+
+
+def _slice_summary(
+    slice_def: BenchmarkSliceDefinition,
+    grouped_results: list[BenchmarkCaseResult],
+    *,
+    kind: str,
+) -> dict:
+    summary = _result_group_summary(grouped_results)
+    target_checks = {
+        target_key: _evaluate_target(summary, target_key, target_value)
+        for target_key, target_value in slice_def.targets.items()
+    }
+    return {
+        "id": slice_def.id,
+        "kind": kind,
+        "description": slice_def.description,
+        "count": summary["count"],
+        "summary": summary,
+        "targets": dict(slice_def.targets),
+        "target_checks": target_checks,
+        "targets_met": all(check["passed"] for check in target_checks.values()) if target_checks else None,
+        "unmet_targets": [key for key, check in target_checks.items() if not check["passed"]],
+    }
 
 
 def load_curated_suite_cases(suite_file: Optional[str | Path]) -> set[tuple[str, str]]:
@@ -257,6 +550,7 @@ def run_benchmark_case(
     rwl_cache: dict[str, object],
     top_n: int = 20,
     min_overlap: int = 30,
+    slice_config_path: Optional[str | Path] = None,
 ) -> BenchmarkCaseResult:
     """Run a single leave-one-file-out benchmark case."""
     excluded_name = Path(case.test_file).name
@@ -309,7 +603,7 @@ def run_benchmark_case(
         warning_count=len(report.warnings),
     )
     result.category, result.likely_causes = classify_case_result(result)
-    return result
+    return assign_benchmark_slices(result, slice_config_path=slice_config_path)
 
 
 def sweep_corpus(
@@ -321,6 +615,7 @@ def sweep_corpus(
     min_overlap: int = 30,
     progress_every: int = 0,
     max_workers: int = 1,
+    slice_config_path: Optional[str | Path] = None,
 ) -> list[BenchmarkCaseResult]:
     """Run a leave-one-file-out sweep across the corpus."""
     reference_dir = Path(reference_dir)
@@ -345,6 +640,7 @@ def sweep_corpus(
                     rwl_cache=rwl_cache,
                     top_n=top_n,
                     min_overlap=min_overlap,
+                    slice_config_path=slice_config_path,
                 )
             )
             if progress_every and index % progress_every == 0:
@@ -372,6 +668,7 @@ def sweep_corpus(
                 file_cases,
                 top_n=top_n,
                 min_overlap=min_overlap,
+                slice_config_path=str(slice_config_path) if slice_config_path is not None else None,
             )
             for file_path, file_cases in grouped_cases.items()
         ]
@@ -386,7 +683,11 @@ def sweep_corpus(
     return results
 
 
-def summarize_corpus_results(results: list[BenchmarkCaseResult]) -> dict:
+def summarize_corpus_results(
+    results: list[BenchmarkCaseResult],
+    *,
+    slice_config_path: Optional[str | Path] = None,
+) -> dict:
     """Aggregate corpus sweep results into actionable buckets."""
     category_counts = Counter(result.category for result in results)
     status_counts = Counter(result.status for result in results)
@@ -395,32 +696,6 @@ def summarize_corpus_results(results: list[BenchmarkCaseResult]) -> dict:
         for result in results
         for cause in result.likely_causes
     )
-
-    def summarize_group(grouped_results: list[BenchmarkCaseResult]) -> dict:
-        count = len(grouped_results)
-        if count == 0:
-            return {"count": 0}
-        top1_passes = sum(1 for result in grouped_results if result.passed_top1)
-        top5_hits = sum(1 for result in grouped_results if result.correct_year_in_top5)
-        recommended = sum(1 for result in grouped_results if result.category == "correct_recommended")
-        no_matches = sum(1 for result in grouped_results if result.category == "no_match")
-        long_offsets = sum(1 for result in grouped_results if result.category == "long_offset_false_positive")
-        ranking_misses = sum(1 for result in grouped_results if result.category == "ranking_miss")
-        return {
-            "count": count,
-            "top1_within_2_years": top1_passes,
-            "top1_within_2_years_rate": round(top1_passes / count, 4),
-            "top5_within_2_years": top5_hits,
-            "top5_within_2_years_rate": round(top5_hits / count, 4),
-            "recommended": recommended,
-            "recommended_rate": round(recommended / count, 4),
-            "no_match": no_matches,
-            "no_match_rate": round(no_matches / count, 4),
-            "ranking_miss": ranking_misses,
-            "ranking_miss_rate": round(ranking_misses / count, 4),
-            "long_offset_false_positive": long_offsets,
-            "long_offset_false_positive_rate": round(long_offsets / count, 4),
-        }
 
     def length_bucket(length: int) -> str:
         if length < 100:
@@ -434,11 +709,16 @@ def summarize_corpus_results(results: list[BenchmarkCaseResult]) -> dict:
     by_state: dict[str, list[BenchmarkCaseResult]] = defaultdict(list)
     by_species: dict[str, list[BenchmarkCaseResult]] = defaultdict(list)
     by_length_bucket: dict[str, list[BenchmarkCaseResult]] = defaultdict(list)
+    by_primary_slice: dict[str, list[BenchmarkCaseResult]] = defaultdict(list)
+    by_overlay: dict[str, list[BenchmarkCaseResult]] = defaultdict(list)
 
     for result in results:
         by_state[result.case.state].append(result)
         by_species[result.case.species or "UNKNOWN"].append(result)
         by_length_bucket[length_bucket(result.case.length)].append(result)
+        by_primary_slice[result.primary_slice_id or "unclassified"].append(result)
+        for overlay_id in result.overlay_ids:
+            by_overlay[overlay_id].append(result)
 
     representative_failures = []
     for result in sorted(
@@ -466,22 +746,62 @@ def summarize_corpus_results(results: list[BenchmarkCaseResult]) -> dict:
             }
         )
 
+    benchmark_slice_catalog = load_benchmark_slice_catalog(slice_config_path)
+    primary_summaries = []
+    for slice_def in benchmark_slice_catalog.primary_slices:
+        primary_summaries.append(
+            _slice_summary(
+                slice_def,
+                by_primary_slice.get(slice_def.id, []),
+                kind="primary",
+            )
+        )
+    if "unclassified" in by_primary_slice:
+        primary_summaries.append(
+            {
+                "id": "unclassified",
+                "kind": "primary",
+                "description": "Cases that did not match any configured primary benchmark slice.",
+                "count": len(by_primary_slice["unclassified"]),
+                "summary": _result_group_summary(by_primary_slice["unclassified"]),
+                "targets": {},
+                "target_checks": {},
+                "targets_met": None,
+                "unmet_targets": [],
+            }
+        )
+
+    overlay_summaries = [
+        _slice_summary(
+            slice_def,
+            by_overlay.get(slice_def.id, []),
+            kind="overlay",
+        )
+        for slice_def in benchmark_slice_catalog.overlays
+    ]
+
     return {
-        "overall": summarize_group(results),
+        "overall": _result_group_summary(results),
         "category_counts": dict(category_counts),
         "status_counts": dict(status_counts),
         "likely_cause_counts": dict(likely_cause_counts),
         "state_summary": {
-            key: summarize_group(value)
+            key: _result_group_summary(value)
             for key, value in sorted(by_state.items())
         },
         "species_summary": {
-            key: summarize_group(value)
+            key: _result_group_summary(value)
             for key, value in sorted(by_species.items())
         },
         "length_bucket_summary": {
-            key: summarize_group(value)
+            key: _result_group_summary(value)
             for key, value in sorted(by_length_bucket.items())
+        },
+        "benchmark_slices": {
+            "config_path": benchmark_slice_catalog.source_path,
+            "taxonomy_order": list(benchmark_slice_catalog.taxonomy_order),
+            "primary_slices": primary_summaries,
+            "overlays": overlay_summaries,
         },
         "representative_failures": representative_failures,
     }
@@ -498,6 +818,7 @@ def _run_file_cases(
     *,
     top_n: int,
     min_overlap: int,
+    slice_config_path: Optional[str | Path] = None,
 ) -> list[BenchmarkCaseResult]:
     global _WORKER_BASE_INDEX
     if _WORKER_BASE_INDEX is None:
@@ -547,6 +868,6 @@ def _run_file_cases(
             warning_count=len(report.warnings),
         )
         result.category, result.likely_causes = classify_case_result(result)
-        results.append(result)
+        results.append(assign_benchmark_slices(result, slice_config_path=slice_config_path))
 
     return results
