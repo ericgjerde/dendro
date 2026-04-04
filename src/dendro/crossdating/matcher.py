@@ -12,6 +12,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from ..materials.catalog import infer_material_group_from_species
 from .correlator import CorrelationResult, find_best_match, segment_correlation
 from .detrend import DetrendMethod, detrend_series, standardize
 from ..reference.chronology_index import ChronologyIndex, ReferenceManifestEntry
@@ -61,6 +62,7 @@ class DatingCandidate:
     reference_species: str
     reference_state: str
     reference_file_type: str
+    reference_material_group: str
     proposed_start_year: int
     proposed_end_year: int
     correlation: float
@@ -103,6 +105,7 @@ class DatingCandidate:
             "reference_id": self.reference_id,
             "reference_name": self.reference_name,
             "reference_species": self.reference_species,
+            "reference_material_group": self.reference_material_group,
             "reference_state": self.reference_state,
             "reference_file_type": self.reference_file_type,
             "proposed_start_year": int(self.proposed_start_year),
@@ -146,6 +149,7 @@ class DatingReport:
     status: str
     policy_version: str
     candidates: list[DatingCandidate]
+    material_inference: Optional[dict] = None
     warnings: list[str] = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
 
@@ -189,6 +193,7 @@ class DatingReport:
             },
             "best_candidate": self.best_candidate.to_dict() if self.best_candidate else None,
             "candidates": [candidate.to_dict() for candidate in self.candidates],
+            "material_inference": self._normalize_scalars(self.material_inference),
             "diagnostics": self._normalize_scalars(self.diagnostics),
             "warnings": list(self.warnings),
         }
@@ -698,6 +703,7 @@ class CrossdateMatcher:
                         reference_id=entry.site_id,
                         reference_name=entry.site_name,
                         reference_species=entry.species,
+                        reference_material_group=entry.material_group or infer_material_group_from_species(entry.species),
                         reference_state=entry.state,
                         reference_file_type=entry.file_type,
                         proposed_start_year=int(best.position),
@@ -910,6 +916,7 @@ class CrossdateMatcher:
         candidates: list[DatingCandidate],
         warnings: list[str],
         diagnostics: dict,
+        material_inference: Optional[dict] = None,
     ) -> DatingReport:
         return DatingReport(
             sample_name=sample_name,
@@ -921,6 +928,7 @@ class CrossdateMatcher:
             status=status,
             policy_version=POLICY_VERSION,
             candidates=candidates,
+            material_inference=material_inference,
             warnings=warnings,
             diagnostics=diagnostics,
         )

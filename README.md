@@ -16,6 +16,12 @@ It does **not** claim publication-grade or fully automated secure dating. The de
 - Platforms: macOS and Linux
 - Primary workflow: CLI first, with interactive measurement for scan review
 - Output: stable JSON report schema and human-readable summaries
+- Walpole mode: late-1700s Walpole, NH house-timber material-group inference for `hemlock`, `white_pine`, `hard_pine`, `oak`, and `chestnut`
+
+Walpole mode is intentionally conservative:
+- it ranks and recommends **material groups**, not exact botanical species,
+- it uses historical context plus dating evidence, not image-only wood anatomy,
+- it returns `inconclusive` when the requested context is unsupported or a material group lacks adequate reference coverage.
 
 ## Status Model
 
@@ -57,6 +63,25 @@ dendro date sample.measurements.csv \
   --reference data/reference \
   --era-start 1750 \
   --era-end 1850 \
+  --json
+
+# Infer likely Walpole material groups before dating
+dendro infer-materials sample.measurements.csv \
+  --reference data/reference \
+  --town Walpole \
+  --state NH \
+  --built-year-range 1760:1800 \
+  --member-type frame \
+  --json
+
+# Let Walpole mode auto-select a supported material group, then date it
+dendro date sample.measurements.csv \
+  --reference data/reference \
+  --town Walpole \
+  --state NH \
+  --built-year-range 1760:1800 \
+  --member-type frame \
+  --auto-material \
   --json
 ```
 
@@ -116,6 +141,29 @@ Key options:
 
 When you know the timber species, pass `--species`. Species-aware ranking is materially more reliable than unconstrained matching.
 
+Walpole-specific options:
+- `--material-group hemlock|white_pine|hard_pine|oak|chestnut`
+- `--auto-material`
+- `--town Walpole`
+- `--state NH`
+- `--built-year-range 1760:1800`
+- `--member-type frame|brace|sill|joist|rafter|board|unknown`
+- `--context-profile walpole_nh_late_1700s_house`
+
+### `dendro infer-materials`
+
+Ranks likely Walpole material groups from a scan, measurement session, or measurement CSV.
+
+```bash
+dendro infer-materials beam-end.measurements.csv \
+  --reference data/reference \
+  --town Walpole \
+  --state NH \
+  --built-year-range 1760:1800 \
+  --member-type frame \
+  --json
+```
+
 ### `dendro parse`
 
 Summarizes a Tucson file, measurement CSV, or saved measurement session JSON.
@@ -157,6 +205,7 @@ The session file stores:
   },
   "best_candidate": {},
   "candidates": [],
+  "material_inference": null,
   "diagnostics": {},
   "warnings": []
 }
@@ -176,6 +225,7 @@ Run the main local gates with:
 source .venv/bin/activate
 pytest -q
 python scripts/validate_crossdating.py --reference-dir data/reference --suite-file tests/fixtures/validated_northeast_v1.json
+python scripts/validate_crossdating.py --reference-dir data/reference --walpole-suite tests/fixtures/walpole_benchmark_v1.json
 ```
 
 The curated v1 benchmark suite lives at `tests/fixtures/validated_northeast_v1.json`.
@@ -192,11 +242,21 @@ python -m dendro.cli.main date tests/fixtures/known_samples/nh001_297031.csv \
   --json \
   --era-start 1500 \
   --era-end 2000
+
+python -m dendro.cli.main infer-materials tests/fixtures/walpole/bp7s_measurements.csv \
+  --reference data/reference \
+  --town Walpole \
+  --state NH \
+  --built-year-range 1760:1800 \
+  --member-type frame \
+  --json
 ```
 
 ## Known Limits
 
 - The validated scope is Northeast-first; broader ITRDB support is future work.
+- Walpole mode is specific to late-1700s Walpole, NH house timbers. It is not a generic species-identification claim.
+- Chestnut is carried as a required-coverage material group. Until the repo ships a real chestnut reference corpus, chestnut recommendations should remain conservative or inconclusive.
 - The curated benchmark suite is intentionally smaller than the full reference
   corpus. Expanding that suite remains ongoing accuracy work.
 - Imaging is interactive and review-driven, not a fully automated vision pipeline.

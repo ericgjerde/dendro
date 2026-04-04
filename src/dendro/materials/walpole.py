@@ -266,7 +266,7 @@ WALPOLE_PROFILE_V1_DATA: dict[str, Any] = {
             "display_name": "American chestnut",
             "support_status": "required_coverage",
             "context_weight": 0.10,
-            "species_codes": ("CHTH",),
+            "species_codes": ("CADE",),
             "aliases": ("chestnut", "american chestnut", "castanea dentata"),
             "notes": (
                 "Historically likely in the region and required for Walpole support "
@@ -360,7 +360,7 @@ WALPOLE_PROFILE_V1_DATA: dict[str, Any] = {
             "citations": ("usfs_eastern_region_tree_species_codes",),
         },
         {
-            "species_code": "CHTH",
+            "species_code": "CADE",
             "material_group": "chestnut",
             "label": "american chestnut",
             "mapping_quality": "direct",
@@ -597,4 +597,3 @@ def load_walpole_profile(version: str = CURRENT_WALPOLE_PROFILE_VERSION) -> Walp
 
 
 WALPOLE_PROFILE_V1 = load_walpole_profile()
-

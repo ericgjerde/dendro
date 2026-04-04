@@ -113,6 +113,7 @@ def test_sparse_coverage_blocks_recommendation_even_for_strong_candidate():
         reference_species="PCRU",
         reference_state="NH",
         reference_file_type="rwl",
+        reference_material_group="hemlock",
         proposed_start_year=1700,
         proposed_end_year=1900,
         correlation=0.5,

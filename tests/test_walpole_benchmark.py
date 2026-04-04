@@ -46,6 +46,9 @@ def test_run_walpole_benchmark_suite_supports_measurements_and_scan_sessions():
     hemlock_results = [result for result in payload["results"] if result["case"]["material_group"] == "hemlock"]
     assert len(hemlock_results) == 2
     assert all(result["status"] == "passed" for result in hemlock_results)
+    assert {result["material_inference_status"] for result in hemlock_results} == {"recommended"}
+    assert {result["recommended_material"] for result in hemlock_results} == {"hemlock"}
+    assert {result["top_material_group"] for result in hemlock_results} == {"hemlock"}
     assert {result["analysis_status"] for result in hemlock_results} == {"ranked"}
     assert {result["top1_outer_ring_year"] for result in hemlock_results} == {1779}
 

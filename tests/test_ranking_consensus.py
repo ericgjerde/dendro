@@ -20,6 +20,7 @@ def _candidate(reference_id: str, reference_name: str, year: int, score: float) 
         reference_species="TSCA",
         reference_state="NY",
         reference_file_type="rwl",
+        reference_material_group="hemlock",
         proposed_start_year=year - 99,
         proposed_end_year=year,
         correlation=0.45,

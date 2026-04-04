@@ -14,7 +14,10 @@ import numpy as np
 import pandas as pd
 
 from ..crossdating.matcher import CrossdateMatcher, DatingCandidate, DatingReport
+from ..materials.catalog import material_group_display_name, material_group_species, normalize_material_group
+from ..materials.inference import MaterialInferenceContext, MaterialInferenceEngine, parse_built_year_range
 from ..reference.chronology_index import ChronologyIndex
+from ..reference.curated import parse_curated_chronology_file
 from ..reference.downloader import download_chronologies
 from ..reference.tucson_parser import (
     load_measurement_session,
@@ -26,6 +29,7 @@ from ..reference.tucson_parser import (
 
 DEFAULT_DATA_DIR = Path.cwd() / "data"
 ORIENTATION_CHOICES = click.Choice(["auto", "oldest_to_newest", "bark_to_pith"], case_sensitive=False)
+MEASUREMENT_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
 @click.group()
@@ -146,6 +150,13 @@ def measure(image: str, dpi: int, output: Optional[str], session_output: Optiona
 @click.option("--era-end", type=int, default=1900, help="Latest plausible outer-ring year.")
 @click.option("--species", "-p", default=None, help="Restrict ranking to species codes.")
 @click.option("--states", "-s", default=None, help="Restrict ranking to state codes.")
+@click.option("--material-group", default=None, help="Restrict ranking to a Walpole material group.")
+@click.option("--auto-material", is_flag=True, default=False, help="Infer a Walpole material group first, then date only that group if recommended.")
+@click.option("--town", default=None, help="Context town for material inference.")
+@click.option("--state", "context_state", default=None, help="Context state for material inference.")
+@click.option("--built-year-range", default=None, help="Context built-year range as START:END.")
+@click.option("--member-type", default="unknown", help="House-member type for Walpole inference.")
+@click.option("--context-profile", default=None, help="Explicit context profile id. Walpole mode currently supports walpole_nh_late_1700s_house.")
 @click.option("--bark-edge/--no-bark-edge", default=True, help="Sample includes the bark edge.")
 @click.option("--orientation", type=ORIENTATION_CHOICES, default="auto", help="Input measurement orientation.")
 @click.option("--output", "-o", type=click.Path(), default=None, help="Write JSON report to this path.")
@@ -160,6 +171,13 @@ def date(
     era_end: int,
     species: Optional[str],
     states: Optional[str],
+    material_group: Optional[str],
+    auto_material: bool,
+    town: Optional[str],
+    context_state: Optional[str],
+    built_year_range: Optional[str],
+    member_type: str,
+    context_profile: Optional[str],
     bark_edge: bool,
     orientation: str,
     output: Optional[str],
@@ -172,6 +190,8 @@ def date(
     reference_dir = Path(reference) if reference else DEFAULT_DATA_DIR / "reference"
     species_filter = [value.strip().upper() for value in species.split(",")] if species else None
     state_filter = [value.strip().upper() for value in states.split(",")] if states else None
+    built_year_range_value = _parse_built_year_range_or_exit(built_year_range)
+    selected_material_group = normalize_material_group(material_group) if material_group else None
 
     try:
         matcher = CrossdateMatcher(reference_dir=reference_dir, allow_remote_metadata=True)
@@ -185,6 +205,8 @@ def date(
 
     reports: list[DatingReport] = []
     loaded_samples: list[np.ndarray] = []
+    inference_engine = MaterialInferenceEngine(matcher=matcher)
+
     for measurement_path in measurements:
         path = Path(measurement_path)
         try:
@@ -193,19 +215,69 @@ def date(
             click.echo(f"Error loading {path}: {exc}", err=True)
             raise SystemExit(1)
 
-        reports.append(
-            matcher.date_sample(
+        inference_report = None
+        if auto_material or selected_material_group or town or context_state or built_year_range_value or member_type != "unknown" or context_profile:
+            inference_report = inference_engine.infer(
                 values=values,
                 sample_name=path.stem,
+                context=MaterialInferenceContext(
+                    town=town,
+                    state=context_state,
+                    built_year_range=built_year_range_value,
+                    member_type=member_type,
+                    profile_id=context_profile,
+                ),
                 has_bark_edge=bark_edge,
                 orientation=orientation,
-                species_filter=species_filter,
-                state_filter=state_filter,
                 era_start=era_start,
                 era_end=era_end,
                 top_n=top,
             )
+
+        active_material_group = selected_material_group
+        if auto_material:
+            active_material_group = inference_report.recommended_material if inference_report is not None else None
+            if active_material_group is None:
+                reports.append(
+                    _build_inconclusive_date_report(
+                        sample_name=path.stem,
+                        values=values,
+                        bark_edge=bark_edge,
+                        orientation=orientation,
+                        warnings=(
+                            list(inference_report.warnings)
+                            if inference_report is not None
+                            else ["Material inference did not recommend a supported Walpole material group."]
+                        ),
+                        diagnostics={
+                            "reference_count": int(len(matcher.index)),
+                            "combined_reference_count": int(len(matcher.index)),
+                            "detrend_method": "spline",
+                            "material_auto_selection_failed": True,
+                        },
+                        material_inference=inference_report.to_dict() if inference_report is not None else None,
+                    )
+                )
+                loaded_samples.append(values)
+                continue
+
+        active_species_filter = list(species_filter) if species_filter else None
+        if active_material_group:
+            active_species_filter = list(material_group_species(active_material_group))
+
+        report = matcher.date_sample(
+            values=values,
+            sample_name=path.stem,
+            has_bark_edge=bark_edge,
+            orientation=orientation,
+            species_filter=active_species_filter,
+            state_filter=state_filter,
+            era_start=era_start,
+            era_end=era_end,
+            top_n=top,
         )
+        report.material_inference = inference_report.to_dict() if inference_report is not None else None
+        reports.append(report)
         loaded_samples.append(values)
 
     if cross_verify and len(reports) > 1:
@@ -241,6 +313,86 @@ def date(
     _print_report(report)
 
 
+@cli.command("infer-materials")
+@click.argument("sample", type=click.Path(exists=True))
+@click.option("--reference", "-r", type=click.Path(exists=True), default=None, help="Reference directory.")
+@click.option("--era-start", type=int, default=1600, help="Earliest plausible outer-ring year.")
+@click.option("--era-end", type=int, default=1900, help="Latest plausible outer-ring year.")
+@click.option("--town", default=None, help="Context town for material inference.")
+@click.option("--state", "context_state", default=None, help="Context state for material inference.")
+@click.option("--built-year-range", default=None, help="Context built-year range as START:END.")
+@click.option("--member-type", default="unknown", help="House-member type for Walpole inference.")
+@click.option("--context-profile", default=None, help="Explicit context profile id. Walpole mode currently supports walpole_nh_late_1700s_house.")
+@click.option("--bark-edge/--no-bark-edge", default=True, help="Sample includes the bark edge.")
+@click.option("--orientation", type=ORIENTATION_CHOICES, default="auto", help="Input measurement orientation.")
+@click.option("--output", "-o", type=click.Path(), default=None, help="Write JSON report to this path.")
+@click.option("--json", "json_output", is_flag=True, default=False, help="Print JSON report to stdout.")
+@click.option("--top", "-n", type=int, default=5, help="Maximum ranked material candidates to return.")
+def infer_materials(
+    sample: str,
+    reference: Optional[str],
+    era_start: int,
+    era_end: int,
+    town: Optional[str],
+    context_state: Optional[str],
+    built_year_range: Optional[str],
+    member_type: str,
+    context_profile: Optional[str],
+    bark_edge: bool,
+    orientation: str,
+    output: Optional[str],
+    json_output: bool,
+    top: int,
+):
+    """Infer likely Walpole material groups from a scan, session, or measurement file."""
+    reference_dir = Path(reference) if reference else DEFAULT_DATA_DIR / "reference"
+    built_year_range_value = _parse_built_year_range_or_exit(built_year_range)
+
+    try:
+        matcher = CrossdateMatcher(reference_dir=reference_dir, allow_remote_metadata=True)
+    except Exception as exc:
+        click.echo(f"Error loading references: {exc}", err=True)
+        raise SystemExit(1)
+
+    if len(matcher.index) == 0:
+        click.echo("No reference chronologies found. Run 'dendro download' first.", err=True)
+        raise SystemExit(1)
+
+    sample_path = Path(sample)
+    try:
+        values = _load_measurements(sample_path)
+    except Exception as exc:
+        click.echo(f"Error loading {sample_path}: {exc}", err=True)
+        raise SystemExit(1)
+
+    engine = MaterialInferenceEngine(matcher=matcher)
+    report = engine.infer(
+        values=values,
+        sample_name=sample_path.stem,
+        context=MaterialInferenceContext(
+            town=town,
+            state=context_state,
+            built_year_range=built_year_range_value,
+            member_type=member_type,
+            profile_id=context_profile,
+        ),
+        has_bark_edge=bark_edge,
+        orientation=orientation,
+        era_start=era_start,
+        era_end=era_end,
+        top_n=top,
+    )
+    payload = report.to_dict()
+
+    if output:
+        Path(output).write_text(json.dumps(payload, indent=2))
+    if json_output:
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    _print_material_inference(report)
+
+
 @cli.command()
 @click.option("--reference", "-r", type=click.Path(exists=True), default=None, help="Reference directory.")
 @click.option("--json", "json_output", is_flag=True, default=False, help="Print manifest summary as JSON.")
@@ -256,6 +408,7 @@ def info(reference: Optional[str], json_output: bool):
         "reference_dir": str(reference_dir),
         "entries": len(index),
         "species": {species: len([entry for entry in index.entries if entry.species == species]) for species in index.get_species()},
+        "material_groups": {group: len([entry for entry in index.entries if entry.material_group == group]) for group in index.get_material_groups()},
         "states": {state: len([entry for entry in index.entries if entry.state == state]) for state in index.get_states()},
         "file_types": {
             file_type: len([entry for entry in index.entries if entry.file_type == file_type])
@@ -277,6 +430,12 @@ def info(reference: Optional[str], json_output: bool):
     if payload["species"]:
         for species_name, count in payload["species"].items():
             click.echo(f"  {species_name}: {count}")
+    else:
+        click.echo("  (none indexed)")
+    click.echo("Material groups:")
+    if payload["material_groups"]:
+        for material_group, count in payload["material_groups"].items():
+            click.echo(f"  {material_group}: {count}")
     else:
         click.echo("  (none indexed)")
     click.echo("States:")
@@ -312,6 +471,18 @@ def parse(reference_file: str):
                 click.echo(f"  ... and {len(rwl.series) - 10} more series")
             return
 
+        if filepath.name.lower().endswith(".curated.json") or filepath.name.lower().endswith(".chronology.json"):
+            chronology = parse_curated_chronology_file(filepath)
+            if chronology is None:
+                click.echo("Could not parse curated chronology file.", err=True)
+                raise SystemExit(1)
+            click.echo(f"Site: {chronology.site_id}")
+            click.echo(f"Species: {chronology.species or '(unknown)'}")
+            click.echo(f"Material group: {chronology.material_group or '(unknown)'}")
+            click.echo(f"Years: {chronology.start_year}-{chronology.end_year}")
+            click.echo(f"Length: {chronology.length}")
+            return
+
         if filepath.suffix.lower() == ".json":
             df = load_measurement_session(filepath)
         else:
@@ -325,6 +496,14 @@ def parse(reference_file: str):
 
 
 def _load_measurements(filepath: Path) -> np.ndarray:
+    if filepath.suffix.lower() in MEASUREMENT_IMAGE_SUFFIXES:
+        resolved = _resolve_scan_measurement_artifact(filepath)
+        if resolved is None:
+            raise ValueError(
+                "Scan input requires a sibling .session.json or .measurements.csv artifact produced by 'dendro measure'."
+            )
+        filepath = resolved
+
     if filepath.suffix.lower() == ".json":
         df = load_measurement_session(filepath)
     elif filepath.suffix.lower() == ".csv":
@@ -339,6 +518,55 @@ def _load_measurements(filepath: Path) -> np.ndarray:
     raise ValueError("Could not locate a width column in the measurement file")
 
 
+def _resolve_scan_measurement_artifact(filepath: Path) -> Optional[Path]:
+    stem = filepath.with_suffix("")
+    candidates = [
+        stem.with_suffix(".session.json"),
+        stem.with_suffix(".measurements.csv"),
+        filepath.parent / f"{filepath.stem}.session.json",
+        filepath.parent / f"{filepath.stem}.measurements.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _parse_built_year_range_or_exit(raw_value: Optional[str]) -> Optional[tuple[int, int]]:
+    try:
+        return parse_built_year_range(raw_value)
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+
+def _build_inconclusive_date_report(
+    *,
+    sample_name: str,
+    values: np.ndarray,
+    bark_edge: bool,
+    orientation: str,
+    warnings: list[str],
+    diagnostics: dict,
+    material_inference: Optional[dict],
+) -> DatingReport:
+    chosen_orientation = "oldest_to_newest" if orientation == "auto" else orientation
+    return DatingReport(
+        sample_name=sample_name,
+        sample_length=len(values),
+        bark_edge=bark_edge,
+        requested_orientation=orientation,
+        chosen_orientation=chosen_orientation,
+        analysis_orientation="oldest_to_newest",
+        status="inconclusive",
+        policy_version="2026.04-assisted-ranking-v1",
+        candidates=[],
+        material_inference=material_inference,
+        warnings=warnings,
+        diagnostics=diagnostics,
+    )
+
+
 def _print_report(report: DatingReport):
     click.echo("=" * 60)
     click.echo("ASSISTED DATING REPORT")
@@ -350,6 +578,25 @@ def _print_report(report: DatingReport):
     click.echo(f"Policy: {report.policy_version}")
     click.echo()
 
+    if report.material_inference:
+        material_inference = report.material_inference
+        click.echo("Material inference:")
+        click.echo(f"  Status: {material_inference['status'].upper()}")
+        click.echo(f"  Support: {material_inference['support_status']}")
+        if material_inference.get("recommended_material"):
+            click.echo(
+                "  Recommended: "
+                + material_group_display_name(material_inference["recommended_material"])
+            )
+        top_materials = material_inference.get("material_candidates", [])[:3]
+        for index, candidate in enumerate(top_materials, start=1):
+            click.echo(
+                f"  {index}. {candidate['display_name']} "
+                f"score={candidate['score']:.3f} "
+                f"support={candidate['support_status']}"
+            )
+        click.echo()
+
     if report.best_candidate is None:
         click.echo("No candidate alignments were produced.")
     else:
@@ -359,7 +606,10 @@ def _print_report(report: DatingReport):
         else:
             label = "Top candidate outer-ring year"
         click.echo(f"{label}: {best.outer_ring_year}")
-        click.echo(f"Reference: {best.reference_name} ({best.reference_species or 'unknown species'}, {best.reference_state or 'unknown state'})")
+        click.echo(
+            f"Reference: {best.reference_name} "
+            f"({best.reference_species or 'unknown species'}, {best.reference_state or 'unknown state'})"
+        )
         click.echo(f"Correlation: {best.correlation:.3f}")
         click.echo(f"T-value: {best.t_value:.2f}")
         click.echo(f"Composite score: {best.composite_score:.3f}")
@@ -376,11 +626,40 @@ def _print_report(report: DatingReport):
         for index, candidate in enumerate(report.candidates, 1):
             click.echo(
                 f"{index}. {candidate.reference_name} "
-                f"[{candidate.reference_species or 'unknown'} {candidate.reference_state or '??'}] "
+                f"[{candidate.reference_species or 'unknown'} {candidate.reference_state or '??'} {candidate.reference_material_group or 'unknown'}] "
                 f"outer={candidate.outer_ring_year} "
                 f"score={candidate.composite_score:.3f} "
                 f"r={candidate.correlation:.3f} "
                 f"t={candidate.t_value:.2f}"
+            )
+
+
+def _print_material_inference(report):
+    click.echo("=" * 60)
+    click.echo("MATERIAL INFERENCE REPORT")
+    click.echo("=" * 60)
+    click.echo(f"Status: {report.status.upper()}")
+    if report.context_profile is not None:
+        click.echo(f"Profile: {report.context_profile.profile_id} v{report.context_profile.version}")
+    if report.recommended_material:
+        click.echo("Recommended material: " + material_group_display_name(report.recommended_material))
+    click.echo(f"Support status: {report.support_status}")
+    click.echo()
+
+    if report.warnings:
+        click.echo("Warnings:")
+        for warning in report.warnings:
+            click.echo(f"  - {warning}")
+        click.echo()
+
+    if report.candidates:
+        click.echo("Ranked material groups:")
+        for index, candidate in enumerate(report.candidates, start=1):
+            click.echo(
+                f"{index}. {candidate.display_name} "
+                f"score={candidate.score:.3f} "
+                f"support={candidate.support_status} "
+                f"best_outer={candidate.best_outer_ring_year or 'n/a'}"
             )
 
 

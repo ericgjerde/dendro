@@ -445,6 +445,16 @@ def run_walpole_analysis(
     print(f"Cases: {overall['count']}")
     if overall["count"]:
         print(f"Passed: {overall['passed']}/{overall['count']} ({overall['pass_rate']:.1%})")
+        if overall.get("material_top1_rate") is not None:
+            print(
+                f"Material top-1: {overall['material_top1']}/{overall['count']} "
+                f"({overall['material_top1_rate']:.1%})"
+            )
+        if overall.get("material_top2_rate") is not None:
+            print(
+                f"Material top-2: {overall['material_top2']}/{overall['count']} "
+                f"({overall['material_top2_rate']:.1%})"
+            )
         print(
             f"Top-1 within ±2 years: {overall['top1_within_2_years']}/{overall['count']} "
             f"({overall['top1_within_2_years_rate']:.1%})"

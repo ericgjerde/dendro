@@ -16,6 +16,8 @@ from typing import Optional
 import numpy as np
 
 from .matcher import CrossdateMatcher
+from ..materials.catalog import SUPPORTED_MATERIAL_GROUPS, material_group_species, normalize_material_group
+from ..materials.inference import MaterialInferenceContext, MaterialInferenceEngine, parse_built_year_range
 from ..reference.chronology_index import ChronologyIndex
 from ..reference.tucson_parser import load_measurement_session, load_measurements_csv, parse_rwl_file
 
@@ -25,16 +27,7 @@ NEAR_MISS_TOLERANCE_YEARS = 5
 DEFAULT_BENCHMARK_SLICES_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "benchmark_slices_v1.json"
 DEFAULT_WALPOLE_BENCHMARK_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "walpole_benchmark_v1.json"
 _WORKER_BASE_INDEX: Optional[ChronologyIndex] = None
-
-WALPOLE_MATERIAL_GROUP_SPECIES_FILTERS: dict[str, tuple[str, ...]] = {
-    "hemlock": ("TSCA",),
-    "white_pine": ("PIST",),
-    "hard_pine": ("PIRI", "PIPA"),
-    "oak": ("QURU", "QUPR", "QUAL", "QUSP", "QUVE"),
-    "chestnut": ("CHTH",),
-}
-
-WALPOLE_SUPPORTED_MATERIAL_GROUPS: tuple[str, ...] = tuple(WALPOLE_MATERIAL_GROUP_SPECIES_FILTERS.keys())
+WALPOLE_SUPPORTED_MATERIAL_GROUPS: tuple[str, ...] = tuple(SUPPORTED_MATERIAL_GROUPS)
 
 
 @dataclass(frozen=True)
@@ -243,6 +236,11 @@ class WalpoleBenchmarkCaseResult:
     case: WalpoleBenchmarkCase
     status: str
     analysis_status: str = ""
+    material_inference_status: str = ""
+    recommended_material: str = ""
+    top_material_group: str = ""
+    material_match_rank: Optional[int] = None
+    material_match_in_top2: bool = False
     input_artifact_kind: str = ""
     input_artifact_path: str = ""
     reference_count: int = 0
@@ -275,6 +273,11 @@ class WalpoleBenchmarkCaseResult:
             "case": self.case.to_dict(),
             "status": self.status,
             "analysis_status": self.analysis_status,
+            "material_inference_status": self.material_inference_status,
+            "recommended_material": self.recommended_material,
+            "top_material_group": self.top_material_group,
+            "material_match_rank": int(self.material_match_rank) if self.material_match_rank is not None else None,
+            "material_match_in_top2": bool(self.material_match_in_top2),
             "input_artifact_kind": self.input_artifact_kind,
             "input_artifact_path": self.input_artifact_path,
             "reference_count": int(self.reference_count),
@@ -957,27 +960,6 @@ def summarize_corpus_results(
         },
         "representative_failures": representative_failures,
     }
-
-
-def _normalize_material_group(material_group: str) -> str:
-    return str(material_group).strip().lower().replace("-", "_")
-
-
-def _parse_year_range(raw_range: object, fallback: tuple[int, int]) -> tuple[int, int]:
-    if raw_range is None:
-        return fallback
-    if isinstance(raw_range, str):
-        pieces = [piece.strip() for piece in raw_range.split(":") if piece.strip()]
-        if len(pieces) == 2:
-            return int(pieces[0]), int(pieces[1])
-    if isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
-        return int(raw_range[0]), int(raw_range[1])
-    if isinstance(raw_range, dict):
-        if "start" in raw_range and "end" in raw_range:
-            return int(raw_range["start"]), int(raw_range["end"])
-    return fallback
-
-
 def _resolve_artifact_path(raw_path: str | Path | None, suite_path: Path) -> Optional[str]:
     if raw_path in {None, ""}:
         return None
@@ -988,7 +970,20 @@ def _resolve_artifact_path(raw_path: str | Path | None, suite_path: Path) -> Opt
 
 
 def _species_filter_for_material_group(material_group: str) -> tuple[str, ...]:
-    return WALPOLE_MATERIAL_GROUP_SPECIES_FILTERS.get(_normalize_material_group(material_group), ())
+    return material_group_species(material_group)
+
+
+def _parse_year_range_with_fallback(raw_range: object, fallback: tuple[int, int]) -> tuple[int, int]:
+    if raw_range is None:
+        return fallback
+    if isinstance(raw_range, dict) and "start" in raw_range and "end" in raw_range:
+        return int(raw_range["start"]), int(raw_range["end"])
+    parsed = parse_built_year_range(str(raw_range)) if isinstance(raw_range, str) else None
+    if parsed is not None:
+        return parsed
+    if isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+        return int(raw_range[0]), int(raw_range[1])
+    return fallback
 
 
 def _load_walpole_case(
@@ -1001,8 +996,8 @@ def _load_walpole_case(
     default_state: str,
     default_year_range: tuple[int, int],
 ) -> WalpoleBenchmarkCase:
-    built_year_range = _parse_year_range(raw_case.get("built_year_range"), default_year_range)
-    material_group = _normalize_material_group(raw_case.get("material_group", ""))
+    built_year_range = _parse_year_range_with_fallback(raw_case.get("built_year_range"), default_year_range)
+    material_group = normalize_material_group(raw_case.get("material_group", ""))
     species_filter = tuple(
         str(item).upper()
         for item in raw_case.get("species_filter", _species_filter_for_material_group(material_group))
@@ -1046,9 +1041,9 @@ def load_walpole_benchmark_suite(suite_file: Optional[str | Path] = None) -> Wal
     payload = json.loads(suite_path.read_text())
     default_town = str(payload.get("town", "Walpole"))
     default_state = str(payload.get("state", "NH")).upper()
-    default_year_range = _parse_year_range(payload.get("built_year_range"), (1760, 1800))
+    default_year_range = _parse_year_range_with_fallback(payload.get("built_year_range"), (1760, 1800))
     supported_material_groups = tuple(
-        _normalize_material_group(item)
+        normalize_material_group(item)
         for item in payload.get("supported_material_groups", WALPOLE_SUPPORTED_MATERIAL_GROUPS)
     )
 
@@ -1149,6 +1144,7 @@ def run_walpole_benchmark_case(
             subset = base_index
         matcher = CrossdateMatcher(index=subset)
         matcher_cache[source_name] = matcher
+    inference_engine = MaterialInferenceEngine(matcher=matcher)
 
     skip_reason = ""
     try:
@@ -1168,10 +1164,38 @@ def run_walpole_benchmark_case(
             skip_reason=skip_reason,
         )
 
-    species_filter = list(case.species_filter) if case.species_filter else list(_species_filter_for_material_group(case.material_group))
     state_filter = list(case.state_filter)
     era_start = case.built_year_start - 25
     era_end = case.built_year_end + 25
+
+    inference = inference_engine.infer(
+        values=values,
+        sample_name=case.series_id or case.id,
+        context=MaterialInferenceContext(
+            town=case.town,
+            state=case.state,
+            built_year_range=(case.built_year_start, case.built_year_end),
+            member_type=case.member_type,
+            profile_id="walpole_nh_late_1700s_house",
+        ),
+        has_bark_edge=case.has_bark_edge,
+        orientation="auto",
+        era_start=era_start,
+        era_end=era_end,
+        min_overlap=min_overlap,
+        top_n=top_n,
+    )
+
+    material_match_rank = None
+    for rank, candidate in enumerate(inference.candidates, start=1):
+        if candidate.material_group == case.material_group:
+            material_match_rank = rank
+            break
+
+    selected_material_group = inference.recommended_material
+    if selected_material_group is None and inference.candidates:
+        selected_material_group = inference.candidates[0].material_group
+    species_filter = list(material_group_species(selected_material_group)) if selected_material_group else list(case.species_filter)
 
     report = matcher.date_sample(
         values=values,
@@ -1195,14 +1219,23 @@ def run_walpole_benchmark_case(
 
     benchmark_status = "failed"
     if case.expected_outer_ring_year is None:
-        benchmark_status = "passed" if report.best_candidate is not None else "failed"
-    elif top1 is not None and abs(top1.outer_ring_year - case.expected_outer_ring_year) <= PASS_TOLERANCE_YEARS:
+        benchmark_status = "passed" if report.best_candidate is not None and material_match_rank == 1 else "failed"
+    elif (
+        top1 is not None
+        and abs(top1.outer_ring_year - case.expected_outer_ring_year) <= PASS_TOLERANCE_YEARS
+        and material_match_rank == 1
+    ):
         benchmark_status = "passed"
 
     result = WalpoleBenchmarkCaseResult(
         case=case,
         status=benchmark_status,
         analysis_status=report.status,
+        material_inference_status=inference.status,
+        recommended_material=inference.recommended_material or "",
+        top_material_group=inference.candidates[0].material_group if inference.candidates else "",
+        material_match_rank=material_match_rank,
+        material_match_in_top2=material_match_rank is not None and material_match_rank <= 2,
         input_artifact_kind=case.input_kind,
         input_artifact_path=artifact_path,
         reference_count=int(report.diagnostics.get("reference_count", 0)),
@@ -1217,13 +1250,13 @@ def run_walpole_benchmark_case(
         top1_t_value=top1.t_value if top1 is not None else None,
         correct_year_rank=correct_year_rank,
         correct_year_in_top5=correct_year_rank is not None and correct_year_rank <= 5,
-        warning_count=len(report.warnings),
-        warnings=list(report.warnings),
+        warning_count=len(report.warnings) + len(inference.warnings),
+        warnings=list(inference.warnings) + list(report.warnings),
     )
     if benchmark_status == "passed" and case.expected_outer_ring_year is not None and result.top1_abs_error is not None and result.top1_abs_error <= PASS_TOLERANCE_YEARS:
-        result.notes = "Holdout recovered within tolerance."
+        result.notes = "Material inference ranked the expected group first and the holdout recovered within tolerance."
     elif benchmark_status == "failed" and case.expected_outer_ring_year is not None:
-        result.notes = "Holdout failed to recover within tolerance."
+        result.notes = "Inference and dating did not both clear the Walpole benchmark policy."
     return result
 
 
@@ -1242,6 +1275,11 @@ def summarize_walpole_benchmark_results(results: list[WalpoleBenchmarkCaseResult
                 "failed": 0,
                 "skipped": 0,
                 "pass_rate": None,
+                "material_top1": 0,
+                "material_top1_rate": None,
+                "material_top2": 0,
+                "material_top2_rate": None,
+                "material_recommended_precision": None,
                 "top1_within_2_years": 0,
                 "top1_within_2_years_rate": None,
                 "top5_within_2_years": 0,
@@ -1253,6 +1291,10 @@ def summarize_walpole_benchmark_results(results: list[WalpoleBenchmarkCaseResult
         passed = sum(1 for result in grouped_results if result.status == "passed")
         failed = sum(1 for result in grouped_results if result.status == "failed")
         skipped_count = sum(1 for result in grouped_results if result.status == "skipped")
+        material_top1 = sum(1 for result in grouped_results if result.material_match_rank == 1)
+        material_top2 = sum(1 for result in grouped_results if result.material_match_in_top2)
+        recommended_materials = [result for result in grouped_results if result.recommended_material]
+        recommended_material_correct = sum(1 for result in recommended_materials if result.recommended_material == result.case.material_group)
         top1_passes = sum(1 for result in grouped_results if result.top1_abs_error is not None and result.top1_abs_error <= PASS_TOLERANCE_YEARS)
         top5_hits = sum(1 for result in grouped_results if result.correct_year_in_top5)
         return {
@@ -1261,6 +1303,15 @@ def summarize_walpole_benchmark_results(results: list[WalpoleBenchmarkCaseResult
             "failed": failed,
             "skipped": skipped_count,
             "pass_rate": round(passed / count, 4),
+            "material_top1": material_top1,
+            "material_top1_rate": round(material_top1 / count, 4),
+            "material_top2": material_top2,
+            "material_top2_rate": round(material_top2 / count, 4),
+            "material_recommended_precision": (
+                round(recommended_material_correct / len(recommended_materials), 4)
+                if recommended_materials
+                else None
+            ),
             "top1_within_2_years": top1_passes,
             "top1_within_2_years_rate": round(top1_passes / count, 4),
             "top5_within_2_years": top5_hits,

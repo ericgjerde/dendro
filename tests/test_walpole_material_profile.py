@@ -39,7 +39,7 @@ def test_species_and_group_lookup_cover_walpole_target_materials():
     assert profile.material_group_for_species("QUAL") == "oak"
     assert profile.material_group_for_species("QUPR") == "oak"
     assert profile.material_group_for_species("QURU") == "oak"
-    assert profile.material_group_for_species("CHTH") == "chestnut"
+    assert profile.material_group_for_species("CADE") == "chestnut"
     assert profile.material_group_for_species("american chestnut") == "chestnut"
     assert profile.material_group_for_species("unknown") is None
 

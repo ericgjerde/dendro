@@ -33,22 +33,33 @@ jobs:
       - name: Validation benchmark
         run: python scripts/validate_crossdating.py --reference-dir data/reference --suite-file tests/fixtures/validated_northeast_v1.json
 
+      - name: Walpole benchmark
+        run: python scripts/validate_crossdating.py --reference-dir data/reference --walpole-suite tests/fixtures/walpole_benchmark_v1.json
+
       - name: CLI smoke checks
         run: |
           python -m dendro.cli.main --help
           python -m dendro.cli.main measure --help
+          python -m dendro.cli.main infer-materials --help
           python -m dendro.cli.main info --reference data/reference --json > info.json
           python -m dendro.cli.main date tests/fixtures/known_samples/nh001_297031.csv --reference data/reference --json --era-start 1500 --era-end 2000 > report.json
+          python -m dendro.cli.main infer-materials tests/fixtures/walpole/bp7s_measurements.csv --reference data/reference --town Walpole --state NH --built-year-range 1760:1800 --member-type frame --json > walpole-materials.json
+          python -m dendro.cli.main date tests/fixtures/walpole/bp7s_measurements.csv --reference data/reference --town Walpole --state NH --built-year-range 1760:1800 --member-type frame --auto-material --json > walpole-date.json
           python - <<'PY'
           import json
           report = json.loads(open("report.json").read())
           expected = json.loads(open("tests/fixtures/expected/nh001_297031.expected.json").read())
+          walpole_materials = json.loads(open("walpole-materials.json").read())
+          walpole_date = json.loads(open("walpole-date.json").read())
           assert report["status"] == expected["status"]
           assert report["sample"]["chosen_orientation"] == expected["sample"]["chosen_orientation"]
           assert report["best_candidate"]["outer_ring_year"] == expected["best_candidate"]["outer_ring_year"]
           assert report["best_candidate"]["reference_name"] == expected["best_candidate"]["reference_name"]
           assert report["best_candidate"]["reference_species"] == expected["best_candidate"]["reference_species"]
           assert report["best_candidate"]["reference_state"] == expected["best_candidate"]["reference_state"]
+          assert walpole_materials["recommended_material"] == "hemlock"
+          assert walpole_date["material_inference"]["recommended_material"] == "hemlock"
+          assert walpole_date["best_candidate"]["outer_ring_year"] == 1779
           PY
 
       - name: Build distribution artifacts

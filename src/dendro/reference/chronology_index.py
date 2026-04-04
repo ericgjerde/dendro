@@ -12,6 +12,7 @@ from typing import Optional
 import numpy as np
 
 from ..crossdating.detrend import DetrendMethod, build_chronology, detrend_series, standardize
+from ..materials.catalog import infer_material_group_from_species
 from .metadata import resolve_reference_metadata
 from .curated import CuratedChronology, parse_curated_chronology_file
 from .tucson_parser import Chronology, RWLFile, parse_crn_file, parse_rwl_file
@@ -155,8 +156,10 @@ class ChronologyIndex:
             if not filepath.is_file():
                 continue
             name = filepath.name.lower()
-            if name.endswith(".rwl") or name.endswith(".crn") or (name.endswith(".json") and name != MANIFEST_FILENAME):
+            if name.endswith(".rwl") or name.endswith(".crn") or name.endswith(".curated.json") or name.endswith(".chronology.json"):
                 if "-noaa." in name:
+                    continue
+                if name == MANIFEST_FILENAME:
                     continue
                 files.append(filepath)
         return sorted(files)
@@ -188,7 +191,7 @@ class ChronologyIndex:
         allow_remote_metadata: bool = False,
     ) -> Optional[ReferenceManifestEntry]:
         name = filepath.name.lower()
-        if filepath.suffix.lower() == ".json" and name != MANIFEST_FILENAME:
+        if name.endswith(".curated.json") or name.endswith(".chronology.json"):
             curated = parse_curated_chronology_file(filepath)
             if curated is None:
                 return None
@@ -214,7 +217,7 @@ class ChronologyIndex:
                 num_years=curated.length,
                 num_series=max(1, int(np.nanmax(curated.sample_depth)) if len(curated.sample_depth) else 1),
                 file_type="curated_json",
-                material_group=curated.material_group,
+                material_group=curated.material_group or infer_material_group_from_species(curated.species),
                 latitude=curated.latitude,
                 longitude=curated.longitude,
                 elevation=curated.elevation,
@@ -269,7 +272,7 @@ class ChronologyIndex:
             num_years=num_years,
             num_series=num_series,
             file_type=file_type,
-            material_group="",
+            material_group=infer_material_group_from_species(resolved.species),
             latitude=resolved.latitude,
             longitude=resolved.longitude,
             elevation=resolved.elevation,
@@ -444,6 +447,7 @@ class ChronologyIndex:
         self.entries = []
         self._by_species = {}
         self._by_state = {}
+        self._by_material_group = {}
 
         for raw_entry in data.get("entries", []):
             entry = self._entry_from_dict(raw_entry)
@@ -469,6 +473,8 @@ class ChronologyIndex:
             if resolved.species and not entry.species:
                 entry.species = resolved.species
                 enriched += 1
+            if not entry.material_group and entry.species:
+                entry.material_group = infer_material_group_from_species(entry.species)
             if resolved.site_name and (not entry.site_name or entry.site_name == Path(entry.filepath).stem):
                 entry.site_name = resolved.site_name
                 enriched += 1

@@ -47,8 +47,9 @@ def test_date_json_contract(runner: CliRunner, known_sample_csv: Path, known_sam
     assert result.exit_code == 0, result.output
 
     payload = json.loads(result.output)
-    assert set(payload.keys()) == {"status", "policy_version", "sample", "best_candidate", "candidates", "diagnostics", "warnings"}
+    assert set(payload.keys()) == {"status", "policy_version", "sample", "best_candidate", "candidates", "material_inference", "diagnostics", "warnings"}
     assert payload["status"] == known_sample_expected["status"]
+    assert payload["material_inference"] is None
     assert payload["sample"]["chosen_orientation"] == known_sample_expected["sample"]["chosen_orientation"]
     assert payload["best_candidate"]["outer_ring_year"] == known_sample_expected["best_candidate"]["outer_ring_year"]
     assert payload["best_candidate"]["reference_name"] == known_sample_expected["best_candidate"]["reference_name"]
