@@ -1,0 +1,246 @@
+{
+  "generated_on": "2026-04-04",
+  "purpose": "Additional open-source species material for Walpole NH house-timber research. These assets are staged separately from data/reference until benchmarked and curated.",
+  "entries": [
+    {
+      "local_path": "data/walpole_open_sources/noaa/vt013.rwl",
+      "material_group": "hemlock",
+      "species_code": "TSCA",
+      "species_name": "Eastern Hemlock",
+      "site_name": "Green River House historical",
+      "state": "VT",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "historical_structure",
+      "start_year": 1568,
+      "end_year": 1834,
+      "series_count": 4,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/vt013.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-13995/html",
+      "notes": "Closest open Northeast historical-building hemlock analog identified in NOAA."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/ma009.rwl",
+      "material_group": "oak",
+      "species_code": "QUSP",
+      "species_name": "Oak spp.",
+      "site_name": "First Parish Church, Groton",
+      "state": "MA",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "historical_structure",
+      "start_year": 1598,
+      "end_year": 1753,
+      "series_count": 11,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/ma009.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-4028/html",
+      "notes": "Strong structural-oak analog from a late colonial New England church."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/ny016.rwl",
+      "material_group": "oak",
+      "species_code": "QUAL",
+      "species_name": "White Oak",
+      "site_name": "Goose Egg Ridge",
+      "state": "NY",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "regional_forest_reference",
+      "start_year": 1704,
+      "end_year": 2002,
+      "series_count": 34,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/ny016.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-13955/html",
+      "notes": "Long white-oak regional reference reaching into the early 1700s."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/ny036.rwl",
+      "material_group": "oak",
+      "species_code": "QURU",
+      "species_name": "Red Oak",
+      "site_name": "Prospect Mountain",
+      "state": "NY",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "regional_forest_reference",
+      "start_year": 1816,
+      "end_year": 2001,
+      "series_count": 28,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/ny036.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-13975/html",
+      "notes": "Adds a red-oak lane to the open-source Walpole species set."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/ma022.rwl",
+      "material_group": "white_pine",
+      "species_code": "PIST",
+      "species_name": "Eastern White Pine",
+      "site_name": "Harvard Forest Petersham",
+      "state": "MA",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "regional_forest_reference",
+      "start_year": 1897,
+      "end_year": 2008,
+      "series_count": 31,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/ma022.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-27502/html",
+      "notes": "Massachusetts white-pine series with official NOAA metadata and citation."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/me048.rwl",
+      "material_group": "white_pine",
+      "species_code": "PIST",
+      "species_name": "Eastern White Pine",
+      "site_name": "Acadia National Park",
+      "state": "ME",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "regional_forest_reference",
+      "start_year": 1824,
+      "end_year": 2009,
+      "series_count": 19,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/me048.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=noaa-tree-33693",
+      "notes": "Older coastal New England white-pine reference; useful for exploratory species expansion."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/ny043.rwl",
+      "material_group": "white_pine",
+      "species_code": "PIST",
+      "species_name": "Eastern White Pine",
+      "site_name": "Crooked Lake",
+      "state": "NY",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "regional_forest_reference",
+      "start_year": 1916,
+      "end_year": 2012,
+      "series_count": 50,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/ny043.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-16777/html",
+      "notes": "Well-described Adirondack white-pine dataset, but not deep enough for direct late-1700s dating on its own."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/me037.rwl",
+      "material_group": "hard_pine",
+      "species_code": "PIRI",
+      "species_name": "Pitch Pine",
+      "site_name": "Wonderland",
+      "state": "ME",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "regional_forest_reference",
+      "start_year": 1804,
+      "end_year": 2014,
+      "series_count": 50,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/me037.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-22310/html",
+      "notes": "Open hard-pine reference for the Walpole caution lane."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/tn012.rwl",
+      "material_group": "chestnut",
+      "species_code": "CADN",
+      "species_name": "American Chestnut",
+      "site_name": "Porters Creek",
+      "state": "TN",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "out_of_region_reference",
+      "start_year": 1700,
+      "end_year": 1924,
+      "series_count": 22,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/tn012.rwl",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-4924/html",
+      "notes": "Chestnut reference outside New England; useful for exploratory chestnut support until a regional corpus exists."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/tn012.crn",
+      "material_group": "chestnut",
+      "species_code": "CADN",
+      "species_name": "American Chestnut",
+      "site_name": "Porters Creek",
+      "state": "TN",
+      "asset_kind": "chronology",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "out_of_region_reference",
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/chronologies/northamerica/usa/tn012.crn",
+      "metadata_url": "https://www.ncei.noaa.gov/metadata/geoportal/rest/metadata/item/noaa-tree-4924/html",
+      "notes": "Companion chronology file for the Porters Creek chestnut raw measurements."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/tn013.rwl",
+      "material_group": "chestnut",
+      "species_code": "CADN",
+      "species_name": "American Chestnut",
+      "site_name": "Greenbrier",
+      "state": "TN",
+      "asset_kind": "raw_measurements",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "out_of_region_reference",
+      "start_year": 1641,
+      "end_year": 1930,
+      "series_count": 14,
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/tn013.rwl",
+      "notes": "Second chestnut raw-measurement source to avoid relying on a single Tennessee site."
+    },
+    {
+      "local_path": "data/walpole_open_sources/noaa/tn013.crn",
+      "material_group": "chestnut",
+      "species_code": "CADN",
+      "species_name": "American Chestnut",
+      "site_name": "Greenbrier",
+      "state": "TN",
+      "asset_kind": "chronology",
+      "benchmark_scan_asset": false,
+      "house_timber_relevance": "out_of_region_reference",
+      "source_url": "https://www.ncei.noaa.gov/pub/data/paleo/treering/chronologies/northamerica/usa/tn013.crn",
+      "notes": "Companion chronology file for the Greenbrier chestnut raw measurements."
+    }
+  ],
+  "supplemental_info_sources": [
+    {
+      "title": "Gilman Garrison House",
+      "publisher": "Historic New England",
+      "url": "https://www.historicnewengland.org/property/gilman-garrison-house/",
+      "supports": [
+        "hemlock",
+        "oak"
+      ]
+    },
+    {
+      "title": "A to Z Primer for Homeowners",
+      "publisher": "Historic New England",
+      "url": "https://www.historicnewengland.org/preservation/for-homeowners-communities/your-old-or-historic-home/a-z-primer-for-homeowners/",
+      "supports": [
+        "white_pine",
+        "oak"
+      ]
+    },
+    {
+      "title": "List of New Hampshire Native Trees",
+      "publisher": "University of New Hampshire Extension",
+      "url": "https://extension.unh.edu/resource/list-new-hampshire-native-trees-0",
+      "supports": [
+        "chestnut",
+        "oak"
+      ]
+    },
+    {
+      "title": "Old-Growth Study Reconstructs Southern NH Forests",
+      "publisher": "Harvard Forest",
+      "url": "https://harvardforest.fas.harvard.edu/notes/old-growth-study-reconstructs-southern-nh-forests/",
+      "supports": [
+        "hemlock",
+        "white_pine",
+        "oak"
+      ]
+    }
+  ],
+  "known_gaps": [
+    "No benchmark-ready external scan-image corpus with known outer-ring dates for white pine, oak, or chestnut was found in this sourcing pass.",
+    "The open chestnut references found here are Appalachian rather than New England.",
+    "The open white-pine references found here are mostly 19th-20th century forest series rather than late-1700s historical-house timbers."
+  ]
+}
