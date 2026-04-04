@@ -1,0 +1,116 @@
+{
+  "name": "walpole_benchmark_v1",
+  "description": "Deterministic Walpole NH late-1700s benchmark schema covering measurements and scan/session tracks.",
+  "scope": "walpole_nh_late_1700s_house",
+  "town": "Walpole",
+  "state": "NH",
+  "built_year_range": [1760, 1800],
+  "supported_material_groups": ["hemlock", "white_pine", "hard_pine", "oak", "chestnut"],
+  "tracks": [
+    {
+      "id": "measurements_to_date",
+      "description": "Measurement CSV inputs that flow through inference and dating.",
+      "input_kind": "measurements",
+      "cases": [
+        {
+          "id": "walpole_hemlock_bp7s_measurements",
+          "label": "CT001 BP7S measurements",
+          "material_group": "hemlock",
+          "member_type": "frame",
+          "town": "Walpole",
+          "state": "NH",
+          "built_year_range": [1760, 1800],
+          "measurement_artifact": "walpole/bp7s_measurements.csv",
+          "source_file": "../../data/reference/ct/ct001.rwl",
+          "series_id": "BP7S",
+          "expected_outer_ring_year": 1779,
+          "has_bark_edge": true,
+          "notes": "Late-1700s hemlock holdout for measurement-mode Walpole benchmarking."
+        }
+      ]
+    },
+    {
+      "id": "scan_session_to_date",
+      "description": "Scan/session inputs that currently run from a session export when the scan artifact is present.",
+      "input_kind": "scan_session",
+      "cases": [
+        {
+          "id": "walpole_hemlock_bp7s_scan_session",
+          "label": "CT001 BP7S scan/session",
+          "material_group": "hemlock",
+          "member_type": "frame",
+          "town": "Walpole",
+          "state": "NH",
+          "built_year_range": [1760, 1800],
+          "scan_artifact": "walpole/bp7s_scan.json",
+          "session_artifact": "walpole/bp7s_session.json",
+          "source_file": "../../data/reference/ct/ct001.rwl",
+          "series_id": "BP7S",
+          "expected_outer_ring_year": 1779,
+          "has_bark_edge": true,
+          "notes": "Scan/session benchmark case backed by a deterministic exported session."
+        },
+        {
+          "id": "walpole_white_pine_missing_scan",
+          "label": "White pine missing scan artifact",
+          "material_group": "white_pine",
+          "member_type": "board",
+          "town": "Walpole",
+          "state": "NH",
+          "built_year_range": [1760, 1800],
+          "session_artifact": "walpole/missing_white_pine_session.json",
+          "source_file": "../../data/reference/ct/ct001.rwl",
+          "series_id": "BP7S",
+          "expected_outer_ring_year": 1779,
+          "skip_if_missing_scan_artifact": true,
+          "notes": "Schema-only case to verify that scan/session inputs can be skipped when the scan artifact is absent."
+        },
+        {
+          "id": "walpole_hard_pine_missing_scan",
+          "label": "Hard pine missing scan artifact",
+          "material_group": "hard_pine",
+          "member_type": "rafter",
+          "town": "Walpole",
+          "state": "NH",
+          "built_year_range": [1760, 1800],
+          "session_artifact": "walpole/missing_hard_pine_session.json",
+          "source_file": "../../data/reference/ct/ct001.rwl",
+          "series_id": "BP7S",
+          "expected_outer_ring_year": 1779,
+          "skip_if_missing_scan_artifact": true,
+          "notes": "Schema-only case for hard pine coverage."
+        },
+        {
+          "id": "walpole_oak_missing_scan",
+          "label": "Oak missing scan artifact",
+          "material_group": "oak",
+          "member_type": "sill",
+          "town": "Walpole",
+          "state": "NH",
+          "built_year_range": [1760, 1800],
+          "session_artifact": "walpole/missing_oak_session.json",
+          "source_file": "../../data/reference/ct/ct001.rwl",
+          "series_id": "BP7S",
+          "expected_outer_ring_year": 1779,
+          "skip_if_missing_scan_artifact": true,
+          "notes": "Schema-only case for oak coverage."
+        },
+        {
+          "id": "walpole_chestnut_missing_scan",
+          "label": "Chestnut missing scan artifact",
+          "material_group": "chestnut",
+          "member_type": "brace",
+          "town": "Walpole",
+          "state": "NH",
+          "built_year_range": [1760, 1800],
+          "session_artifact": "walpole/missing_chestnut_session.json",
+          "source_file": "../../data/reference/ct/ct001.rwl",
+          "series_id": "BP7S",
+          "expected_outer_ring_year": 1779,
+          "skip_if_missing_scan_artifact": true,
+          "notes": "Schema-only case for chestnut coverage."
+        }
+      ]
+    }
+  ]
+}

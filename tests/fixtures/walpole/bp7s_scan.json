@@ -1,0 +1,7 @@
+{
+  "scan_id": "walpole-bp7s-scan",
+  "source_file": "data/reference/ct/ct001.rwl",
+  "dpi": 600,
+  "scan_kind": "placeholder",
+  "notes": "Placeholder scan artifact used to exercise the scan/session Walpole benchmark track."
+}

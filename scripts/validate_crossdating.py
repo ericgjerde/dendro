@@ -23,8 +23,10 @@ from dendro.reference.metadata import resolve_reference_metadata
 from dendro.crossdating.matcher import CrossdateMatcher
 from dendro.crossdating.benchmark import (
     DEFAULT_BENCHMARK_SLICES_PATH,
+    load_walpole_benchmark_suite,
     sweep_corpus,
     summarize_corpus_results,
+    run_walpole_benchmark_suite,
 )
 from dendro.crossdating.detrend import DetrendMethod
 
@@ -397,6 +399,89 @@ def run_corpus_analysis(
     return payload
 
 
+def run_walpole_analysis(
+    reference_dir: str,
+    *,
+    suite_file: str,
+    output_json: str | None,
+    top_n: int,
+    min_overlap: int,
+):
+    """Run the deterministic Walpole benchmark suite."""
+    suite = load_walpole_benchmark_suite(suite_file)
+    payload = run_walpole_benchmark_suite(
+        reference_dir=reference_dir,
+        suite_file=suite_file,
+        top_n=top_n,
+        min_overlap=min_overlap,
+    )
+    payload["suite"] = {
+        "name": suite.name,
+        "description": suite.description,
+        "scope": suite.scope,
+        "town": suite.town,
+        "state": suite.state,
+        "built_year_range": list(suite.built_year_range),
+        "supported_material_groups": list(suite.supported_material_groups),
+        "tracks": [
+            {
+                "id": track.id,
+                "description": track.description,
+                "input_kind": track.input_kind,
+                "case_count": len(track.cases),
+            }
+            for track in suite.tracks
+        ],
+    }
+
+    if output_json:
+        Path(output_json).write_text(json.dumps(payload, indent=2))
+
+    overall = payload["summary"]["overall"]
+    print("\n" + "=" * 60)
+    print("WALPOLE BENCHMARK SUMMARY")
+    print("=" * 60)
+    print(f"Suite: {suite.name}")
+    print(f"Cases: {overall['count']}")
+    if overall["count"]:
+        print(f"Passed: {overall['passed']}/{overall['count']} ({overall['pass_rate']:.1%})")
+        print(
+            f"Top-1 within ±2 years: {overall['top1_within_2_years']}/{overall['count']} "
+            f"({overall['top1_within_2_years_rate']:.1%})"
+        )
+        print(
+            f"Top-5 contains correct year: {overall['top5_within_2_years']}/{overall['count']} "
+            f"({overall['top5_within_2_years_rate']:.1%})"
+        )
+        print(f"Recommended: {overall['recommended']}/{overall['count']} ({overall['recommended_rate']:.1%})")
+    else:
+        print("Passed: 0/0")
+        print("Top-1 within ±2 years: 0/0")
+        print("Top-5 contains correct year: 0/0")
+        print("Recommended: 0/0")
+    print()
+    print("Track summaries:")
+    for track_id, summary in sorted(payload["summary"].get("track_summary", {}).items()):
+        print(
+            f"  {track_id}: {summary['count']} cases, "
+            f"{summary['passed']} passed, {summary['skipped']} skipped"
+        )
+    print()
+    print("Material groups:")
+    for material_group, summary in sorted(payload["summary"].get("material_group_summary", {}).items()):
+        print(
+            f"  {material_group}: {summary['count']} cases, "
+            f"{summary['passed']} passed, {summary['skipped']} skipped"
+        )
+    if payload["summary"].get("skip_reasons"):
+        print()
+        print("Skip reasons:")
+        for reason, count in sorted(payload["summary"]["skip_reasons"].items(), key=lambda item: item[1], reverse=True):
+            print(f"  {reason}: {count}")
+
+    return payload
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -413,6 +498,10 @@ if __name__ == "__main__":
         "--corpus-sweep",
         action="store_true",
         help="Run a structured leave-one-file-out sweep across the bundled corpus",
+    )
+    parser.add_argument(
+        "--walpole-suite",
+        help="Run the Walpole benchmark suite JSON file",
     )
     parser.add_argument(
         "--scope",
@@ -462,6 +551,15 @@ if __name__ == "__main__":
             top_n=args.top_n,
             workers=args.workers,
             benchmark_slices=args.benchmark_slices,
+        )
+        success = True
+    elif args.walpole_suite:
+        run_walpole_analysis(
+            reference_dir=args.reference_dir,
+            suite_file=args.walpole_suite,
+            output_json=args.output_json,
+            top_n=args.top_n,
+            min_overlap=30,
         )
         success = True
     elif args.suite_file:

@@ -13,15 +13,28 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 from .matcher import CrossdateMatcher
 from ..reference.chronology_index import ChronologyIndex
-from ..reference.tucson_parser import parse_rwl_file
+from ..reference.tucson_parser import load_measurement_session, load_measurements_csv, parse_rwl_file
 
 
 PASS_TOLERANCE_YEARS = 2
 NEAR_MISS_TOLERANCE_YEARS = 5
 DEFAULT_BENCHMARK_SLICES_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "benchmark_slices_v1.json"
+DEFAULT_WALPOLE_BENCHMARK_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "walpole_benchmark_v1.json"
 _WORKER_BASE_INDEX: Optional[ChronologyIndex] = None
+
+WALPOLE_MATERIAL_GROUP_SPECIES_FILTERS: dict[str, tuple[str, ...]] = {
+    "hemlock": ("TSCA",),
+    "white_pine": ("PIST",),
+    "hard_pine": ("PIRI", "PIPA"),
+    "oak": ("QURU", "QUPR", "QUAL", "QUSP", "QUVE"),
+    "chestnut": ("CHTH",),
+}
+
+WALPOLE_SUPPORTED_MATERIAL_GROUPS: tuple[str, ...] = tuple(WALPOLE_MATERIAL_GROUP_SPECIES_FILTERS.keys())
 
 
 @dataclass(frozen=True)
@@ -142,6 +155,145 @@ class BenchmarkSliceCatalog:
     @property
     def overlay_by_id(self) -> dict[str, BenchmarkSliceDefinition]:
         return {slice_def.id: slice_def for slice_def in self.overlays}
+
+
+@dataclass(frozen=True)
+class WalpoleBenchmarkTrack:
+    """A Walpole benchmark track covering a single input modality."""
+
+    id: str
+    description: str
+    input_kind: str
+    cases: tuple["WalpoleBenchmarkCase", ...]
+
+
+@dataclass(frozen=True)
+class WalpoleBenchmarkSuite:
+    """Loaded Walpole-specific benchmark schema."""
+
+    source_path: str
+    name: str
+    description: str
+    scope: str
+    town: str
+    state: str
+    built_year_range: tuple[int, int]
+    supported_material_groups: tuple[str, ...]
+    tracks: tuple[WalpoleBenchmarkTrack, ...]
+
+
+@dataclass(frozen=True)
+class WalpoleBenchmarkCase:
+    """A deterministic Walpole benchmark case."""
+
+    id: str
+    label: str
+    track: str
+    input_kind: str
+    material_group: str
+    member_type: str
+    town: str
+    state: str
+    built_year_start: int
+    built_year_end: int
+    measurement_artifact: str | None = None
+    session_artifact: str | None = None
+    scan_artifact: str | None = None
+    source_file: str | None = None
+    series_id: str | None = None
+    expected_outer_ring_year: int | None = None
+    has_bark_edge: bool = True
+    skip_if_missing_scan_artifact: bool = True
+    skip_if_missing_session_artifact: bool = True
+    species_filter: tuple[str, ...] = ()
+    state_filter: tuple[str, ...] = ()
+    notes: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "track": self.track,
+            "input_kind": self.input_kind,
+            "material_group": self.material_group,
+            "member_type": self.member_type,
+            "town": self.town,
+            "state": self.state,
+            "built_year_start": int(self.built_year_start),
+            "built_year_end": int(self.built_year_end),
+            "measurement_artifact": self.measurement_artifact,
+            "session_artifact": self.session_artifact,
+            "scan_artifact": self.scan_artifact,
+            "source_file": self.source_file,
+            "series_id": self.series_id,
+            "expected_outer_ring_year": int(self.expected_outer_ring_year) if self.expected_outer_ring_year is not None else None,
+            "has_bark_edge": bool(self.has_bark_edge),
+            "skip_if_missing_scan_artifact": bool(self.skip_if_missing_scan_artifact),
+            "skip_if_missing_session_artifact": bool(self.skip_if_missing_session_artifact),
+            "species_filter": list(self.species_filter),
+            "state_filter": list(self.state_filter),
+            "notes": self.notes,
+        }
+
+
+@dataclass
+class WalpoleBenchmarkCaseResult:
+    """Structured outcome for a single Walpole benchmark case."""
+
+    case: WalpoleBenchmarkCase
+    status: str
+    analysis_status: str = ""
+    input_artifact_kind: str = ""
+    input_artifact_path: str = ""
+    reference_count: int = 0
+    candidate_count: int = 0
+    top1_outer_ring_year: Optional[int] = None
+    top1_error: Optional[int] = None
+    top1_reference_name: str = ""
+    top1_reference_state: str = ""
+    top1_reference_species: str = ""
+    top1_score: Optional[float] = None
+    top1_correlation: Optional[float] = None
+    top1_t_value: Optional[float] = None
+    correct_year_rank: Optional[int] = None
+    correct_year_in_top5: bool = False
+    skip_reason: str = ""
+    warning_count: int = 0
+    warnings: list[str] = field(default_factory=list)
+    notes: str = ""
+
+    @property
+    def top1_abs_error(self) -> Optional[int]:
+        return abs(self.top1_error) if self.top1_error is not None else None
+
+    @property
+    def passed_top1(self) -> bool:
+        return self.status == "passed" and self.top1_abs_error is not None and self.top1_abs_error <= PASS_TOLERANCE_YEARS
+
+    def to_dict(self) -> dict:
+        return {
+            "case": self.case.to_dict(),
+            "status": self.status,
+            "analysis_status": self.analysis_status,
+            "input_artifact_kind": self.input_artifact_kind,
+            "input_artifact_path": self.input_artifact_path,
+            "reference_count": int(self.reference_count),
+            "candidate_count": int(self.candidate_count),
+            "top1_outer_ring_year": int(self.top1_outer_ring_year) if self.top1_outer_ring_year is not None else None,
+            "top1_error": int(self.top1_error) if self.top1_error is not None else None,
+            "top1_reference_name": self.top1_reference_name,
+            "top1_reference_state": self.top1_reference_state,
+            "top1_reference_species": self.top1_reference_species,
+            "top1_score": round(float(self.top1_score), 4) if self.top1_score is not None else None,
+            "top1_correlation": round(float(self.top1_correlation), 4) if self.top1_correlation is not None else None,
+            "top1_t_value": round(float(self.top1_t_value), 3) if self.top1_t_value is not None else None,
+            "correct_year_rank": int(self.correct_year_rank) if self.correct_year_rank is not None else None,
+            "correct_year_in_top5": bool(self.correct_year_in_top5),
+            "skip_reason": self.skip_reason,
+            "warning_count": int(self.warning_count),
+            "warnings": list(self.warnings),
+            "notes": self.notes,
+        }
 
 
 def _default_slice_catalog_path() -> Path:
@@ -805,6 +957,394 @@ def summarize_corpus_results(
         },
         "representative_failures": representative_failures,
     }
+
+
+def _normalize_material_group(material_group: str) -> str:
+    return str(material_group).strip().lower().replace("-", "_")
+
+
+def _parse_year_range(raw_range: object, fallback: tuple[int, int]) -> tuple[int, int]:
+    if raw_range is None:
+        return fallback
+    if isinstance(raw_range, str):
+        pieces = [piece.strip() for piece in raw_range.split(":") if piece.strip()]
+        if len(pieces) == 2:
+            return int(pieces[0]), int(pieces[1])
+    if isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+        return int(raw_range[0]), int(raw_range[1])
+    if isinstance(raw_range, dict):
+        if "start" in raw_range and "end" in raw_range:
+            return int(raw_range["start"]), int(raw_range["end"])
+    return fallback
+
+
+def _resolve_artifact_path(raw_path: str | Path | None, suite_path: Path) -> Optional[str]:
+    if raw_path in {None, ""}:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = (suite_path.parent / path).resolve()
+    return str(path)
+
+
+def _species_filter_for_material_group(material_group: str) -> tuple[str, ...]:
+    return WALPOLE_MATERIAL_GROUP_SPECIES_FILTERS.get(_normalize_material_group(material_group), ())
+
+
+def _load_walpole_case(
+    raw_case: dict,
+    *,
+    suite_path: Path,
+    track_id: str,
+    input_kind: str,
+    default_town: str,
+    default_state: str,
+    default_year_range: tuple[int, int],
+) -> WalpoleBenchmarkCase:
+    built_year_range = _parse_year_range(raw_case.get("built_year_range"), default_year_range)
+    material_group = _normalize_material_group(raw_case.get("material_group", ""))
+    species_filter = tuple(
+        str(item).upper()
+        for item in raw_case.get("species_filter", _species_filter_for_material_group(material_group))
+    )
+    state_filter = tuple(
+        str(item).upper()
+        for item in raw_case.get("state_filter", [])
+    )
+    return WalpoleBenchmarkCase(
+        id=str(raw_case.get("id") or raw_case.get("label") or f"{track_id}:{len(raw_case)}"),
+        label=str(raw_case.get("label", raw_case.get("id", f"{track_id}:{material_group}"))),
+        track=track_id,
+        input_kind=input_kind,
+        material_group=material_group,
+        member_type=str(raw_case.get("member_type", "unknown")).strip().lower(),
+        town=str(raw_case.get("town", default_town)),
+        state=str(raw_case.get("state", default_state)).upper(),
+        built_year_start=int(built_year_range[0]),
+        built_year_end=int(built_year_range[1]),
+        measurement_artifact=_resolve_artifact_path(raw_case.get("measurement_artifact"), suite_path),
+        session_artifact=_resolve_artifact_path(raw_case.get("session_artifact"), suite_path),
+        scan_artifact=_resolve_artifact_path(raw_case.get("scan_artifact"), suite_path),
+        source_file=_resolve_artifact_path(raw_case.get("source_file"), suite_path) or raw_case.get("source_file"),
+        series_id=str(raw_case.get("series_id")) if raw_case.get("series_id") is not None else None,
+        expected_outer_ring_year=int(raw_case["expected_outer_ring_year"]) if raw_case.get("expected_outer_ring_year") is not None else None,
+        has_bark_edge=bool(raw_case.get("has_bark_edge", True)),
+        skip_if_missing_scan_artifact=bool(raw_case.get("skip_if_missing_scan_artifact", True)),
+        skip_if_missing_session_artifact=bool(raw_case.get("skip_if_missing_session_artifact", True)),
+        species_filter=species_filter,
+        state_filter=state_filter,
+        notes=str(raw_case.get("notes", "")),
+    )
+
+
+def load_walpole_benchmark_suite(suite_file: Optional[str | Path] = None) -> WalpoleBenchmarkSuite:
+    """Load a Walpole-specific benchmark suite."""
+    if suite_file is None:
+        suite_file = DEFAULT_WALPOLE_BENCHMARK_PATH
+
+    suite_path = Path(suite_file).resolve()
+    payload = json.loads(suite_path.read_text())
+    default_town = str(payload.get("town", "Walpole"))
+    default_state = str(payload.get("state", "NH")).upper()
+    default_year_range = _parse_year_range(payload.get("built_year_range"), (1760, 1800))
+    supported_material_groups = tuple(
+        _normalize_material_group(item)
+        for item in payload.get("supported_material_groups", WALPOLE_SUPPORTED_MATERIAL_GROUPS)
+    )
+
+    tracks: list[WalpoleBenchmarkTrack] = []
+    raw_tracks = payload.get("tracks")
+    if raw_tracks is None and payload.get("cases") is not None:
+        raw_tracks = [
+            {
+                "id": payload.get("track_id", "measurements_to_date"),
+                "description": payload.get("description", ""),
+                "input_kind": payload.get("input_kind", "measurements"),
+                "cases": payload.get("cases", []),
+            }
+        ]
+
+    for raw_track in raw_tracks or []:
+        track_id = str(raw_track.get("id", "measurements_to_date"))
+        input_kind = str(raw_track.get("input_kind", "measurements"))
+        cases = tuple(
+            _load_walpole_case(
+                raw_case,
+                suite_path=suite_path,
+                track_id=track_id,
+                input_kind=input_kind,
+                default_town=default_town,
+                default_state=default_state,
+                default_year_range=default_year_range,
+            )
+            for raw_case in raw_track.get("cases", [])
+        )
+        tracks.append(
+            WalpoleBenchmarkTrack(
+                id=track_id,
+                description=str(raw_track.get("description", "")),
+                input_kind=input_kind,
+                cases=cases,
+            )
+        )
+
+    return WalpoleBenchmarkSuite(
+        source_path=str(suite_path),
+        name=str(payload.get("name", suite_path.stem)),
+        description=str(payload.get("description", "")),
+        scope=str(payload.get("scope", "walpole_nh_late_1700s_house")),
+        town=default_town,
+        state=default_state,
+        built_year_range=default_year_range,
+        supported_material_groups=supported_material_groups,
+        tracks=tuple(tracks),
+    )
+
+
+def _load_walpole_sample_values(
+    case: WalpoleBenchmarkCase,
+) -> tuple[np.ndarray, str]:
+    """Load sample values for a Walpole benchmark case."""
+    if case.input_kind == "measurements":
+        if not case.measurement_artifact:
+            raise FileNotFoundError("Missing measurement artifact")
+        frame = load_measurements_csv(case.measurement_artifact)
+        return np.asarray(frame["width"], dtype=np.float64), case.measurement_artifact
+
+    if case.input_kind == "scan_session":
+        if case.skip_if_missing_scan_artifact and not case.scan_artifact:
+            raise FileNotFoundError("Missing scan artifact")
+        if case.skip_if_missing_scan_artifact and case.scan_artifact and not Path(case.scan_artifact).exists():
+            raise FileNotFoundError(f"Missing scan artifact at {case.scan_artifact}")
+        if not case.session_artifact:
+            raise FileNotFoundError("Missing measurement session artifact")
+        frame = load_measurement_session(case.session_artifact)
+        return np.asarray(frame["width"], dtype=np.float64), case.session_artifact
+
+    raise ValueError(f"Unsupported Walpole input kind: {case.input_kind}")
+
+
+def run_walpole_benchmark_case(
+    case: WalpoleBenchmarkCase,
+    *,
+    reference_dir: str | Path,
+    base_index: Optional[ChronologyIndex] = None,
+    matcher_cache: Optional[dict[str, CrossdateMatcher]] = None,
+    artifact_cache: Optional[dict[str, np.ndarray]] = None,
+    top_n: int = 10,
+    min_overlap: int = 30,
+) -> WalpoleBenchmarkCaseResult:
+    """Run a single Walpole benchmark case."""
+    matcher_cache = matcher_cache if matcher_cache is not None else {}
+    artifact_cache = artifact_cache if artifact_cache is not None else {}
+    reference_dir = Path(reference_dir)
+    base_index = base_index or ChronologyIndex(reference_dir)
+
+    source_name = Path(case.source_file).name if case.source_file else ""
+    matcher = matcher_cache.get(source_name)
+    if matcher is None:
+        if source_name:
+            subset = build_subset_index(base_index, source_name)
+        else:
+            subset = base_index
+        matcher = CrossdateMatcher(index=subset)
+        matcher_cache[source_name] = matcher
+
+    skip_reason = ""
+    try:
+        values = artifact_cache.get(case.id)
+        artifact_path = ""
+        if values is None:
+            values, artifact_path = _load_walpole_sample_values(case)
+            artifact_cache[case.id] = values
+        else:
+            artifact_path = case.measurement_artifact or case.session_artifact or ""
+    except FileNotFoundError as exc:
+        skip_reason = str(exc)
+        return WalpoleBenchmarkCaseResult(
+            case=case,
+            status="skipped",
+            analysis_status="skipped",
+            skip_reason=skip_reason,
+        )
+
+    species_filter = list(case.species_filter) if case.species_filter else list(_species_filter_for_material_group(case.material_group))
+    state_filter = list(case.state_filter)
+    era_start = case.built_year_start - 25
+    era_end = case.built_year_end + 25
+
+    report = matcher.date_sample(
+        values=values,
+        sample_name=case.series_id or case.id,
+        has_bark_edge=case.has_bark_edge,
+        species_filter=species_filter or None,
+        state_filter=state_filter or None,
+        era_start=era_start,
+        era_end=era_end,
+        min_overlap=min_overlap,
+        top_n=top_n,
+    )
+
+    top1 = report.best_candidate
+    correct_year_rank = None
+    if case.expected_outer_ring_year is not None:
+        for rank, candidate in enumerate(report.candidates, start=1):
+            if abs(candidate.outer_ring_year - case.expected_outer_ring_year) <= PASS_TOLERANCE_YEARS:
+                correct_year_rank = rank
+                break
+
+    benchmark_status = "failed"
+    if case.expected_outer_ring_year is None:
+        benchmark_status = "passed" if report.best_candidate is not None else "failed"
+    elif top1 is not None and abs(top1.outer_ring_year - case.expected_outer_ring_year) <= PASS_TOLERANCE_YEARS:
+        benchmark_status = "passed"
+
+    result = WalpoleBenchmarkCaseResult(
+        case=case,
+        status=benchmark_status,
+        analysis_status=report.status,
+        input_artifact_kind=case.input_kind,
+        input_artifact_path=artifact_path,
+        reference_count=int(report.diagnostics.get("reference_count", 0)),
+        candidate_count=len(report.candidates),
+        top1_outer_ring_year=top1.outer_ring_year if top1 is not None else None,
+        top1_error=(top1.outer_ring_year - case.expected_outer_ring_year) if top1 is not None and case.expected_outer_ring_year is not None else None,
+        top1_reference_name=top1.reference_name if top1 is not None else "",
+        top1_reference_state=top1.reference_state if top1 is not None else "",
+        top1_reference_species=top1.reference_species if top1 is not None else "",
+        top1_score=top1.composite_score if top1 is not None else None,
+        top1_correlation=top1.correlation if top1 is not None else None,
+        top1_t_value=top1.t_value if top1 is not None else None,
+        correct_year_rank=correct_year_rank,
+        correct_year_in_top5=correct_year_rank is not None and correct_year_rank <= 5,
+        warning_count=len(report.warnings),
+        warnings=list(report.warnings),
+    )
+    if benchmark_status == "passed" and case.expected_outer_ring_year is not None and result.top1_abs_error is not None and result.top1_abs_error <= PASS_TOLERANCE_YEARS:
+        result.notes = "Holdout recovered within tolerance."
+    elif benchmark_status == "failed" and case.expected_outer_ring_year is not None:
+        result.notes = "Holdout failed to recover within tolerance."
+    return result
+
+
+def summarize_walpole_benchmark_results(results: list[WalpoleBenchmarkCaseResult], *, suite: Optional[WalpoleBenchmarkSuite] = None) -> dict:
+    """Aggregate Walpole benchmark results into track and material summaries."""
+    overall_count = len(results)
+    executed = [result for result in results if result.status != "skipped"]
+    skipped = [result for result in results if result.status == "skipped"]
+
+    def _summary(grouped_results: list[WalpoleBenchmarkCaseResult]) -> dict:
+        count = len(grouped_results)
+        if count == 0:
+            return {
+                "count": 0,
+                "passed": 0,
+                "failed": 0,
+                "skipped": 0,
+                "pass_rate": None,
+                "top1_within_2_years": 0,
+                "top1_within_2_years_rate": None,
+                "top5_within_2_years": 0,
+                "top5_within_2_years_rate": None,
+                "recommended": 0,
+                "recommended_rate": None,
+            }
+
+        passed = sum(1 for result in grouped_results if result.status == "passed")
+        failed = sum(1 for result in grouped_results if result.status == "failed")
+        skipped_count = sum(1 for result in grouped_results if result.status == "skipped")
+        top1_passes = sum(1 for result in grouped_results if result.top1_abs_error is not None and result.top1_abs_error <= PASS_TOLERANCE_YEARS)
+        top5_hits = sum(1 for result in grouped_results if result.correct_year_in_top5)
+        return {
+            "count": count,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped_count,
+            "pass_rate": round(passed / count, 4),
+            "top1_within_2_years": top1_passes,
+            "top1_within_2_years_rate": round(top1_passes / count, 4),
+            "top5_within_2_years": top5_hits,
+            "top5_within_2_years_rate": round(top5_hits / count, 4),
+            "recommended": sum(1 for result in grouped_results if result.analysis_status == "recommended"),
+            "recommended_rate": round(sum(1 for result in grouped_results if result.analysis_status == "recommended") / count, 4),
+        }
+
+    by_track: dict[str, list[WalpoleBenchmarkCaseResult]] = defaultdict(list)
+    by_material_group: dict[str, list[WalpoleBenchmarkCaseResult]] = defaultdict(list)
+    by_input_kind: dict[str, list[WalpoleBenchmarkCaseResult]] = defaultdict(list)
+    by_skip_reason: Counter[str] = Counter()
+
+    for result in results:
+        by_track[result.case.track].append(result)
+        by_material_group[result.case.material_group].append(result)
+        by_input_kind[result.case.input_kind].append(result)
+        if result.status == "skipped" and result.skip_reason:
+            by_skip_reason[result.skip_reason] += 1
+
+    return {
+        "suite": {
+            "name": suite.name if suite is not None else None,
+            "description": suite.description if suite is not None else None,
+            "scope": suite.scope if suite is not None else None,
+            "town": suite.town if suite is not None else None,
+            "state": suite.state if suite is not None else None,
+            "built_year_range": list(suite.built_year_range) if suite is not None else None,
+            "supported_material_groups": list(suite.supported_material_groups) if suite is not None else [],
+        },
+        "overall": _summary(results),
+        "executed": _summary(executed),
+        "skipped": _summary(skipped),
+        "track_summary": {
+            key: _summary(value)
+            for key, value in sorted(by_track.items())
+        },
+        "material_group_summary": {
+            key: _summary(value)
+            for key, value in sorted(by_material_group.items())
+        },
+        "input_kind_summary": {
+            key: _summary(value)
+            for key, value in sorted(by_input_kind.items())
+        },
+        "skip_reasons": dict(by_skip_reason),
+    }
+
+
+def run_walpole_benchmark_suite(
+    reference_dir: str | Path,
+    suite_file: str | Path,
+    *,
+    top_n: int = 10,
+    min_overlap: int = 30,
+) -> dict:
+    """Run the Walpole benchmark suite and return structured output."""
+    suite = load_walpole_benchmark_suite(suite_file)
+    base_index = ChronologyIndex(reference_dir)
+    matcher_cache: dict[str, CrossdateMatcher] = {}
+    artifact_cache: dict[str, np.ndarray] = {}
+    results: list[WalpoleBenchmarkCaseResult] = []
+
+    for track in suite.tracks:
+        for case in track.cases:
+            results.append(
+                run_walpole_benchmark_case(
+                    case,
+                    reference_dir=reference_dir,
+                    base_index=base_index,
+                    matcher_cache=matcher_cache,
+                    artifact_cache=artifact_cache,
+                    top_n=top_n,
+                    min_overlap=min_overlap,
+                )
+            )
+
+    payload = {
+        "reference_dir": str(Path(reference_dir).resolve()),
+        "suite_file": suite.source_path,
+        "results": [result.to_dict() for result in results],
+        "summary": summarize_walpole_benchmark_results(results, suite=suite),
+    }
+    return payload
 
 
 def _init_worker(reference_dir: str):
