@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m pip install -e ".[dev]"
+
+      - name: Unit and contract tests
+        run: pytest -q
+
+      - name: Validation benchmark
+        run: python scripts/validate_crossdating.py --reference-dir data/reference --suite-file tests/fixtures/validated_northeast_v1.json
+
+      - name: CLI smoke checks
+        run: |
+          python -m dendro.cli.main --help
+          python -m dendro.cli.main measure --help
+          python -m dendro.cli.main info --reference data/reference --json > info.json
+          python -m dendro.cli.main date tests/fixtures/known_samples/nh001_297031.csv --reference data/reference --json --era-start 1500 --era-end 2000 > report.json
+          python - <<'PY'
+          import json
+          report = json.loads(open("report.json").read())
+          expected = json.loads(open("tests/fixtures/expected/nh001_297031.expected.json").read())
+          assert report["status"] == expected["status"]
+          assert report["sample"]["chosen_orientation"] == expected["sample"]["chosen_orientation"]
+          assert report["best_candidate"]["outer_ring_year"] == expected["best_candidate"]["outer_ring_year"]
+          assert report["best_candidate"]["reference_name"] == expected["best_candidate"]["reference_name"]
+          assert report["best_candidate"]["reference_species"] == expected["best_candidate"]["reference_species"]
+          assert report["best_candidate"]["reference_state"] == expected["best_candidate"]["reference_state"]
+          PY
+
+      - name: Build distribution artifacts
+        run: python -m build

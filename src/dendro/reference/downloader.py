@@ -1,28 +1,26 @@
 """
-Download reference chronologies from ITRDB (NOAA NCEI).
-
-The International Tree-Ring Data Bank is hosted by NOAA's National Centers
-for Environmental Information. This module downloads chronology and raw
-measurement files for specified regions and species.
+Download and inventory Northeast ITRDB reference files.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Optional
 from urllib.parse import urljoin
 
 import requests
 from tqdm import tqdm
 
+from .metadata import (
+    ITRDB_CHRONOLOGIES_BASE,
+    ITRDB_MEASUREMENTS_BASE,
+    SPECIES_CODES,
+    parse_noaa_template,
+)
 
-# Base URLs for ITRDB data
-ITRDB_MEASUREMENTS_BASE = "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/"
-ITRDB_CHRONOLOGIES_BASE = "https://www.ncei.noaa.gov/pub/data/paleo/treering/chronologies/northamerica/usa/"
 
-# Species codes relevant for northeastern US dating
 NORTHEAST_SPECIES = {
     "PIST": "Pinus strobus (Eastern White Pine)",
     "TSCA": "Tsuga canadensis (Eastern Hemlock)",
@@ -34,140 +32,138 @@ NORTHEAST_SPECIES = {
     "ACSA": "Acer saccharum (Sugar Maple)",
 }
 
-# State abbreviations for northeastern US
 NORTHEAST_STATES = ["ct", "ma", "me", "nh", "ny", "ri", "vt"]
 
 
 @dataclass
 class ChronologyFile:
-    """Metadata about a downloadable chronology file."""
-
     filename: str
     url: str
     state: str
     site_code: str
+    file_type: str
+    sidecar_filename: Optional[str] = None
+    sidecar_url: str = ""
     species: Optional[str] = None
-    file_type: str = "crn"  # 'crn' for chronology, 'rwl' for raw measurements
+    site_name: str = ""
 
     @property
     def local_path(self) -> str:
-        """Suggested local filename."""
-        return f"{self.state}/{self.filename}"
+        return f"{self.state.lower()}/{self.filename}"
 
 
 def list_available_files(
     states: Optional[list[str]] = None,
     species: Optional[list[str]] = None,
-    base_url: str = ITRDB_MEASUREMENTS_BASE,
+    *,
+    file_type: str = "rwl",
 ) -> list[ChronologyFile]:
     """
-    List available chronology files from ITRDB for given states and species.
-
-    ITRDB files are stored in a flat directory with state codes as filename prefixes
-    (e.g., nh001.rwl, ma002.rwl).
-
-    Args:
-        states: List of state codes (e.g., ['nh', 'vt', 'ma']). Defaults to all NE states.
-        species: List of species codes (e.g., ['PIST', 'TSCA']). None = all species.
-        base_url: Base URL for the ITRDB archive.
-
-    Returns:
-        List of ChronologyFile objects describing available downloads.
+    List downloadable RWL or CRN files with NOAA sidecar metadata when available.
     """
     if states is None:
         states = NORTHEAST_STATES
+    states = [state.lower() for state in states]
+    species = [code.upper() for code in species] if species else None
 
-    states = [s.lower() for s in states]
-    files = []
+    base_url = ITRDB_MEASUREMENTS_BASE if file_type == "rwl" else ITRDB_CHRONOLOGIES_BASE
+    response = requests.get(base_url, timeout=60)
+    response.raise_for_status()
 
-    # Fetch the flat directory listing
-    try:
-        response = requests.get(base_url, timeout=60)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        print(f"Warning: Could not fetch directory listing: {e}")
-        return files
+    hrefs = set(re.findall(r'href="([^"]+)"', response.text, re.IGNORECASE))
+    grouped: dict[str, dict[str, str]] = {}
 
-    # Parse directory listing - find all .rwl files
-    # Files are named like: nh001.rwl, nh001-noaa.rwl, nh001-rwl-noaa.txt
-    file_links = re.findall(r'href="([^"]+\.rwl)"', response.text, re.IGNORECASE)
-
-    for filename in file_links:
-        # Skip parent directory links
-        if filename.startswith("..") or filename.startswith("/"):
+    for href in hrefs:
+        name = href.lower()
+        if href.startswith("..") or href.startswith("/"):
             continue
 
-        # Extract state code from filename (first 2 letters)
-        state_match = re.match(r'^([a-z]{2})(\d{3})', filename.lower())
-        if not state_match:
+        if file_type == "rwl":
+            main_match = re.match(r"^([a-z]{2}\d+[a-z]?)\.rwl$", name)
+            sidecar_match = re.match(r"^([a-z]{2}\d+[a-z]?)-rwl-noaa\.txt$", name)
+        else:
+            main_match = re.match(r"^([a-z]{2}\d+[a-z]?)\.crn$", name)
+            sidecar_match = re.match(r"^([a-z]{2}\d+[a-z]?)-crn-noaa\.txt$", name)
+
+        if main_match:
+            site_code = main_match.group(1)
+            grouped.setdefault(site_code, {})["main"] = href
             continue
 
-        state = state_match.group(1)
-        site_code = state_match.group(1) + state_match.group(2)
+        if sidecar_match:
+            site_code = sidecar_match.group(1)
+            grouped.setdefault(site_code, {})["sidecar"] = href
 
-        # Filter by state
-        if state not in states:
+    files: list[ChronologyFile] = []
+    for site_code, assets in sorted(grouped.items()):
+        state = site_code[:2]
+        if state not in states or "main" not in assets:
             continue
 
-        # Prefer the simple .rwl files over -noaa.rwl variants for cleaner data
-        # Skip -noaa variants to avoid duplicates
-        if '-noaa.rwl' in filename.lower():
-            continue
-
-        file_info = ChronologyFile(
-            filename=filename,
-            url=urljoin(base_url, filename),
+        item = ChronologyFile(
+            filename=assets["main"],
+            url=urljoin(base_url, assets["main"]),
             state=state.upper(),
-            site_code=site_code,
-            file_type="rwl",
+            site_code=site_code.upper(),
+            file_type=file_type,
+            sidecar_filename=assets.get("sidecar"),
+            sidecar_url=urljoin(base_url, assets["sidecar"]) if assets.get("sidecar") else "",
         )
 
-        # Try to identify species from filename
-        for sp_code in NORTHEAST_SPECIES:
-            if sp_code.lower() in filename.lower():
-                file_info.species = sp_code
-                break
+        if item.sidecar_url:
+            metadata = _fetch_remote_sidecar_metadata(item.sidecar_url)
+            if metadata.species:
+                item.species = metadata.species
+            if metadata.site_name:
+                item.site_name = metadata.site_name
 
-        # Filter by species if specified (but include unknown species)
-        if species is not None and file_info.species is not None:
-            if file_info.species not in species:
-                continue
+        if species and item.species not in species:
+            continue
 
-        files.append(file_info)
+        files.append(item)
 
     return files
+
+
+def _fetch_remote_sidecar_metadata(sidecar_url: str):
+    try:
+        response = requests.get(sidecar_url, timeout=30)
+        response.raise_for_status()
+        return parse_noaa_template(response.text, source="remote")
+    except requests.RequestException:
+        return parse_noaa_template("", source="remote")
 
 
 def download_file(
     file_info: ChronologyFile,
     output_dir: str | Path,
     overwrite: bool = False,
-) -> Path:
+) -> list[Path]:
     """
-    Download a single chronology file.
-
-    Args:
-        file_info: ChronologyFile describing the file to download.
-        output_dir: Directory to save the file.
-        overwrite: If True, overwrite existing files.
-
-    Returns:
-        Path to the downloaded file.
+    Download a main chronology file and its NOAA sidecar metadata if available.
     """
     output_dir = Path(output_dir)
     state_dir = output_dir / file_info.state.lower()
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = state_dir / file_info.filename
+    downloaded: list[Path] = []
 
-    if output_path.exists() and not overwrite:
-        return output_path
+    main_path = state_dir / file_info.filename
+    if overwrite or not main_path.exists():
+        response = requests.get(file_info.url, timeout=60)
+        response.raise_for_status()
+        main_path.write_bytes(response.content)
+    downloaded.append(main_path)
 
-    response = requests.get(file_info.url, timeout=60)
-    response.raise_for_status()
+    if file_info.sidecar_filename and file_info.sidecar_url:
+        sidecar_path = state_dir / file_info.sidecar_filename
+        if overwrite or not sidecar_path.exists():
+            response = requests.get(file_info.sidecar_url, timeout=60)
+            response.raise_for_status()
+            sidecar_path.write_bytes(response.content)
+        downloaded.append(sidecar_path)
 
-    output_path.write_bytes(response.content)
-    return output_path
+    return downloaded
 
 
 def download_chronologies(
@@ -179,18 +175,7 @@ def download_chronologies(
     progress: bool = True,
 ) -> list[Path]:
     """
-    Download chronologies from ITRDB for specified states and species.
-
-    Args:
-        output_dir: Directory to save downloaded files.
-        states: List of state codes. Defaults to northeastern US states.
-        species: List of species codes. None = all species.
-        file_types: List of file types ('rwl', 'crn'). Defaults to both.
-        overwrite: If True, re-download existing files.
-        progress: If True, show progress bar.
-
-    Returns:
-        List of paths to downloaded files.
+    Download Northeast RWL/CRN files and NOAA sidecars truthfully.
     """
     if file_types is None:
         file_types = ["rwl", "crn"]
@@ -198,35 +183,20 @@ def download_chronologies(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    downloaded = []
+    inventory: list[ChronologyFile] = []
+    for file_type in file_types:
+        print(f"Fetching {file_type.upper()} listings...")
+        inventory.extend(list_available_files(states=states, species=species, file_type=file_type))
 
-    # Get files from both measurements and chronologies directories
-    all_files = []
-
-    if "rwl" in file_types:
-        print("Fetching measurement file listings...")
-        all_files.extend(list_available_files(states, species, ITRDB_MEASUREMENTS_BASE))
-
-    if "crn" in file_types:
-        print("Fetching chronology file listings...")
-        all_files.extend(list_available_files(states, species, ITRDB_CHRONOLOGIES_BASE))
-
-    # Filter by file type
-    all_files = [f for f in all_files if f.file_type in file_types]
-
-    print(f"Found {len(all_files)} files to download")
-
-    iterator = tqdm(all_files, desc="Downloading") if progress else all_files
-
+    downloaded: list[Path] = []
+    iterator = tqdm(inventory, desc="Downloading") if progress else inventory
     for file_info in iterator:
         try:
-            path = download_file(file_info, output_dir, overwrite)
-            downloaded.append(path)
-        except requests.RequestException as e:
-            print(f"Warning: Failed to download {file_info.filename}: {e}")
-            continue
+            downloaded.extend(download_file(file_info, output_dir, overwrite=overwrite))
+        except requests.RequestException as exc:
+            print(f"Warning: Failed to download {file_info.filename}: {exc}")
 
-    print(f"Downloaded {len(downloaded)} files to {output_dir}")
+    print(f"Downloaded {len(downloaded)} artifacts to {output_dir}")
     return downloaded
 
 
@@ -234,25 +204,11 @@ def download_northeast_reference_set(
     output_dir: str | Path,
     species: Optional[list[str]] = None,
 ) -> list[Path]:
-    """
-    Download a curated set of reference chronologies for northeastern US dating.
-
-    This downloads both raw measurements (.rwl) and site chronologies (.crn)
-    for the northeastern states, focusing on species commonly used in
-    historical timber construction.
-
-    Args:
-        output_dir: Directory to save downloaded files.
-        species: Species to include. Defaults to PIST and TSCA.
-
-    Returns:
-        List of paths to downloaded files.
-    """
     if species is None:
         species = ["PIST", "TSCA", "QUAL", "QURU"]
 
-    print(f"Downloading reference chronologies for: {', '.join(species)}")
-    print(f"States: {', '.join(s.upper() for s in NORTHEAST_STATES)}")
+    print(f"Downloading Northeast references for: {', '.join(species)}")
+    print(f"States: {', '.join(state.upper() for state in NORTHEAST_STATES)}")
 
     return download_chronologies(
         output_dir=output_dir,

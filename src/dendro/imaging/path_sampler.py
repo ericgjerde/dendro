@@ -242,15 +242,17 @@ def widths_to_tucson(
     widths_mm: np.ndarray,
     series_id: str,
     end_year: int,
+    orientation: str = "oldest_to_newest",
     output_path: Optional[str | Path] = None,
 ) -> str:
     """
     Convert ring widths to Tucson format for export.
 
     Args:
-        widths_mm: Ring widths in mm (from bark to pith).
+        widths_mm: Ring widths in mm.
         series_id: Series identifier (max 8 characters).
         end_year: Year of the outermost ring (bark).
+        orientation: Input orientation, one of "oldest_to_newest" or "bark_to_pith".
         output_path: Optional path to write the file.
 
     Returns:
@@ -259,9 +261,8 @@ def widths_to_tucson(
     # Convert mm to 0.01mm units (standard Tucson)
     widths_001mm = (widths_mm * 100).astype(int)
 
-    # Reverse if needed (Tucson goes from oldest to newest)
-    # Our widths are bark-to-pith (newest to oldest), so reverse
-    widths_001mm = widths_001mm[::-1]
+    if orientation == "bark_to_pith":
+        widths_001mm = widths_001mm[::-1]
 
     start_year = end_year - len(widths_001mm) + 1
 
@@ -309,6 +310,7 @@ def widths_to_tucson(
 def widths_to_csv(
     widths_mm: np.ndarray,
     end_year: Optional[int] = None,
+    orientation: str = "oldest_to_newest",
     output_path: Optional[str | Path] = None,
 ) -> str:
     """
@@ -317,19 +319,25 @@ def widths_to_csv(
     Args:
         widths_mm: Ring widths in mm.
         end_year: Optional year of outermost ring.
+        orientation: Input orientation, one of "oldest_to_newest" or "bark_to_pith".
         output_path: Optional path to write the file.
 
     Returns:
         CSV format string.
     """
-    lines = ["year,width_mm"]
+    export_widths = np.asarray(widths_mm, dtype=np.float64)
+    if orientation == "bark_to_pith":
+        export_widths = export_widths[::-1]
+
+    lines = ["ring_index,width_mm"]
 
     if end_year is not None:
-        start_year = end_year - len(widths_mm) + 1
-        for i, w in enumerate(widths_mm[::-1]):  # Reverse to oldest first
-            lines.append(f"{start_year + i},{w:.3f}")
+        start_year = end_year - len(export_widths) + 1
+        lines[0] = "ring_index,calendar_year,width_mm"
+        for i, w in enumerate(export_widths):
+            lines.append(f"{i + 1},{start_year + i},{w:.3f}")
     else:
-        for i, w in enumerate(widths_mm[::-1]):
+        for i, w in enumerate(export_widths):
             lines.append(f"{i + 1},{w:.3f}")
 
     result = "\n".join(lines)

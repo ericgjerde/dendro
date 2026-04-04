@@ -1,12 +1,8 @@
 """
-Command-line interface for the dendrochronology dating tool.
-
-Commands:
-    dendro download  - Download reference chronologies from ITRDB
-    dendro measure   - Extract ring widths from scanned image
-    dendro date      - Cross-date a sample against references
-    dendro info      - Show information about downloaded references
+Public CLI for Northeast-first assisted dendrochronology workflows.
 """
+
+from __future__ import annotations
 
 import json
 import sys
@@ -15,225 +11,148 @@ from typing import Optional
 
 import click
 import numpy as np
+import pandas as pd
+
+from ..crossdating.matcher import CrossdateMatcher, DatingCandidate, DatingReport
+from ..reference.chronology_index import ChronologyIndex
+from ..reference.downloader import download_chronologies
+from ..reference.tucson_parser import (
+    load_measurement_session,
+    load_measurements_csv,
+    parse_crn_file,
+    parse_rwl_file,
+)
 
 
-# Default data directory
 DEFAULT_DATA_DIR = Path.cwd() / "data"
+ORIENTATION_CHOICES = click.Choice(["auto", "oldest_to_newest", "bark_to_pith"], case_sensitive=False)
 
 
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version="0.2.0")
 def cli():
     """
-    Dendrochronology dating tool for historic timber analysis.
+    Assisted Northeast dendrochronology CLI.
 
-    Cross-date wood samples against ITRDB reference chronologies
-    to determine felling years.
+    This tool ranks plausible outer-ring calendar-year alignments against ITRDB
+    references. It recommends a candidate only when the current policy gates are
+    cleared; otherwise results remain ranked or inconclusive.
     """
-    pass
 
 
 @cli.command()
+@click.option("--states", "-s", default="me,nh,vt,ma,ct,ri,ny", help="State codes to download.")
+@click.option("--species", "-p", default=None, help="Species codes to download.")
+@click.option("--output", "-o", type=click.Path(), default=None, help="Output directory.")
 @click.option(
-    "--states", "-s",
-    default="me,nh,vt,ma,ct,ri,ny",
-    help="State codes to download (comma-separated)."
+    "--file-types",
+    default="rwl,crn",
+    help="Comma-separated file types to fetch. Supported values: rwl, crn.",
 )
-@click.option(
-    "--species", "-p",
-    default="PIST,TSCA,QUAL,QURU",
-    help="Species codes to download (comma-separated)."
-)
-@click.option(
-    "--output", "-o",
-    type=click.Path(),
-    default=None,
-    help="Output directory for downloaded files."
-)
-@click.option(
-    "--overwrite/--no-overwrite",
-    default=False,
-    help="Overwrite existing files."
-)
-def download(states: str, species: str, output: Optional[str], overwrite: bool):
-    """
-    Download reference chronologies from ITRDB.
-
-    Downloads ring-width measurements and site chronologies for
-    specified states and species from NOAA's ITRDB archive.
-
-    Example:
-        dendro download --states=nh,vt,ma --species=PIST,TSCA
-    """
-    from ..reference.downloader import download_chronologies
-
+@click.option("--overwrite/--no-overwrite", default=False, help="Overwrite existing files.")
+def download(states: str, species: Optional[str], output: Optional[str], file_types: str, overwrite: bool):
+    """Download Northeast references and NOAA sidecar metadata."""
     output_dir = Path(output) if output else DEFAULT_DATA_DIR / "reference"
-
-    state_list = [s.strip().lower() for s in states.split(",")]
-    species_list = [s.strip().upper() for s in species.split(",")]
-
-    click.echo(f"Downloading chronologies for:")
-    click.echo(f"  States: {', '.join(s.upper() for s in state_list)}")
-    click.echo(f"  Species: {', '.join(species_list)}")
-    click.echo(f"  Output: {output_dir}")
-    click.echo()
+    state_list = [value.strip().lower() for value in states.split(",") if value.strip()]
+    species_list = [value.strip().upper() for value in species.split(",")] if species else None
+    requested_file_types = [value.strip().lower() for value in file_types.split(",") if value.strip()]
 
     try:
-        files = download_chronologies(
+        downloaded = download_chronologies(
             output_dir=output_dir,
             states=state_list,
             species=species_list,
+            file_types=requested_file_types,
             overwrite=overwrite,
         )
-        click.echo(f"\nDownloaded {len(files)} files successfully.")
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
+        index = ChronologyIndex(output_dir)
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Downloaded {len(downloaded)} artifacts into {output_dir}")
+    click.echo(f"Indexed {len(index)} reference chronologies")
+    if index.get_species():
+        click.echo("Species: " + ", ".join(index.get_species()))
+    if index.get_states():
+        click.echo("States: " + ", ".join(index.get_states()))
 
 
 @cli.command()
 @click.argument("image", type=click.Path(exists=True))
-@click.option(
-    "--dpi", "-d",
-    type=int,
-    default=1200,
-    help="Scanner resolution in DPI."
-)
-@click.option(
-    "--output", "-o",
-    type=click.Path(),
-    default=None,
-    help="Output file for measurements (CSV or RWL)."
-)
-@click.option(
-    "--auto/--manual",
-    default=False,
-    help="Use automatic ring detection (default: manual)."
-)
-def measure(image: str, dpi: int, output: Optional[str], auto: bool):
-    """
-    Extract ring widths from a scanned wood sample.
-
-    Opens an interactive viewer to mark the measurement path
-    and ring boundaries. Exports measurements to CSV or Tucson format.
-
-    Example:
-        dendro measure sample.tiff --dpi=2400 --output=sample.csv
-    """
-    from ..imaging.viewer import MeasurementViewer
+@click.option("--dpi", "-d", type=int, default=1200, help="Scanner resolution in DPI.")
+@click.option("--output", "-o", type=click.Path(), default=None, help="Output CSV path.")
+@click.option("--session-output", type=click.Path(), default=None, help="Session JSON path.")
+def measure(image: str, dpi: int, output: Optional[str], session_output: Optional[str]):
+    """Measure ring widths from a scan and persist a reviewable session."""
     from ..imaging.path_sampler import widths_to_csv
+    from ..imaging.viewer import MeasurementViewer
 
     image_path = Path(image)
+    output_path = Path(output) if output else image_path.with_suffix(".measurements.csv")
+    session_path = Path(session_output) if session_output else output_path.with_suffix(".session.json")
 
-    if output:
-        output_path = Path(output)
-    else:
-        output_path = image_path.with_suffix(".csv")
+    measured_widths: list[np.ndarray] = []
 
-    click.echo(f"Opening {image_path.name} for measurement...")
-    click.echo(f"DPI: {dpi}")
-    click.echo()
-    click.echo("Instructions:")
-    click.echo("  1. Click to mark path from bark (outer) to pith (center)")
-    click.echo("  2. Press ENTER to switch to ring marking mode")
-    click.echo("  3. Click to mark ring boundaries (or press 'A' for auto-detect)")
-    click.echo("  4. Press ENTER to save and close")
-    click.echo()
+    def on_complete(widths: np.ndarray):
+        measured_widths.append(widths)
 
-    widths = None
-
-    def on_complete(w):
-        nonlocal widths
-        widths = w
+    click.echo("Opening interactive measurement workflow...")
+    click.echo("Measurement export orientation: oldest_to_newest")
+    click.echo(f"CSV output: {output_path}")
+    click.echo(f"Session output: {session_path}")
 
     try:
-        viewer = MeasurementViewer(image_path, dpi, on_complete)
+        viewer = MeasurementViewer(
+            image_path=image_path,
+            dpi=dpi,
+            on_complete=on_complete,
+            session_output=session_path,
+        )
         viewer.show()
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
 
-        if widths is not None and len(widths) > 0:
-            csv_output = widths_to_csv(widths, output_path=output_path)
-            click.echo(f"\nSaved {len(widths)} ring measurements to {output_path}")
-        else:
-            click.echo("No measurements recorded.")
+    if not measured_widths:
+        click.echo("No measurements were exported.")
+        return
 
-    except ImportError as e:
-        click.echo(f"Error: {e}", err=True)
-        click.echo("Install required packages: pip install matplotlib opencv-python")
-        sys.exit(1)
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
+    widths_to_csv(
+        measured_widths[0],
+        orientation="oldest_to_newest",
+        output_path=output_path,
+    )
+
+    warnings = []
+    try:
+        payload = json.loads(session_path.read_text())
+        warnings = payload.get("warnings", [])
+    except Exception:
+        pass
+
+    click.echo(f"Saved measurements to {output_path}")
+    click.echo(f"Saved session to {session_path}")
+    if warnings:
+        click.echo("QC warnings:")
+        for warning in warnings:
+            click.echo(f"  - {warning}")
 
 
 @cli.command()
 @click.argument("measurements", type=click.Path(exists=True), nargs=-1, required=True)
-@click.option(
-    "--reference", "-r",
-    type=click.Path(exists=True),
-    default=None,
-    help="Directory containing reference chronologies."
-)
-@click.option(
-    "--era-start",
-    type=int,
-    default=1600,
-    help="Earliest possible felling year."
-)
-@click.option(
-    "--era-end",
-    type=int,
-    default=1900,
-    help="Latest possible felling year."
-)
-@click.option(
-    "--species", "-p",
-    default=None,
-    help="Species codes to match against (comma-separated)."
-)
-@click.option(
-    "--states", "-s",
-    default=None,
-    help="State codes to match against (comma-separated)."
-)
-@click.option(
-    "--bark-edge/--no-bark-edge",
-    default=True,
-    help="Sample includes bark edge (for exact felling year)."
-)
-@click.option(
-    "--output", "-o",
-    type=click.Path(),
-    default=None,
-    help="Output file for results (JSON)."
-)
-@click.option(
-    "--top", "-n",
-    type=int,
-    default=10,
-    help="Number of top matches to display."
-)
-@click.option(
-    "--plot", "-P",
-    is_flag=True,
-    default=False,
-    help="Generate diagnostic plots (saves PNG alongside output)."
-)
-@click.option(
-    "--cross-verify", "-X",
-    is_flag=True,
-    default=False,
-    help="Cross-verify multiple samples for consistency."
-)
-@click.option(
-    "--segments/--no-segments",
-    default=True,
-    help="Show segment-by-segment correlation analysis."
-)
-@click.option(
-    "--markers/--no-markers",
-    default=True,
-    help="Detect and display marker year matches."
-)
+@click.option("--reference", "-r", type=click.Path(exists=True), default=None, help="Reference directory.")
+@click.option("--era-start", type=int, default=1600, help="Earliest plausible outer-ring year.")
+@click.option("--era-end", type=int, default=1900, help="Latest plausible outer-ring year.")
+@click.option("--species", "-p", default=None, help="Restrict ranking to species codes.")
+@click.option("--states", "-s", default=None, help="Restrict ranking to state codes.")
+@click.option("--bark-edge/--no-bark-edge", default=True, help="Sample includes the bark edge.")
+@click.option("--orientation", type=ORIENTATION_CHOICES, default="auto", help="Input measurement orientation.")
+@click.option("--output", "-o", type=click.Path(), default=None, help="Write JSON report to this path.")
+@click.option("--json", "json_output", is_flag=True, default=False, help="Print JSON report to stdout.")
+@click.option("--top", "-n", type=int, default=10, help="Maximum ranked candidates to return.")
+@click.option("--plot", is_flag=True, default=False, help="Save diagnostic plots alongside the JSON report.")
+@click.option("--cross-verify", is_flag=True, default=False, help="Aggregate multiple sample reports.")
 def date(
     measurements: tuple[str, ...],
     reference: Optional[str],
@@ -242,566 +161,283 @@ def date(
     species: Optional[str],
     states: Optional[str],
     bark_edge: bool,
+    orientation: str,
     output: Optional[str],
+    json_output: bool,
     top: int,
     plot: bool,
     cross_verify: bool,
-    segments: bool,
-    markers: bool,
 ):
-    """
-    Cross-date sample(s) against reference chronologies.
-
-    Takes ring width measurements (CSV with 'width' column) and
-    matches against downloaded ITRDB chronologies to determine
-    the felling year.
-
-    Single sample mode:
-        dendro date sample.csv --era-start=1750 --era-end=1850
-
-    Multi-sample verification mode (recommended for confidence):
-        dendro date beam1.csv beam2.csv beam3.csv --cross-verify
-    """
-    import pandas as pd
-    from ..crossdating.matcher import CrossdateMatcher
-    from ..crossdating.detrend import DetrendMethod, detrend_series, standardize
-    from ..crossdating.correlator import sliding_correlation
-
+    """Rank candidate outer-ring calendar years against Northeast references."""
     reference_dir = Path(reference) if reference else DEFAULT_DATA_DIR / "reference"
+    species_filter = [value.strip().upper() for value in species.split(",")] if species else None
+    state_filter = [value.strip().upper() for value in states.split(",")] if states else None
 
-    # Parse filters
-    species_filter = [s.strip().upper() for s in species.split(",")] if species else None
-    state_filter = [s.strip().upper() for s in states.split(",")] if states else None
-
-    # Load all measurement files
-    all_samples = []
-    for mpath in measurements:
-        measurements_path = Path(mpath)
-        try:
-            if measurements_path.suffix.lower() == ".csv":
-                df = pd.read_csv(measurements_path)
-                if "width" in df.columns:
-                    values = df["width"].values
-                elif "width_mm" in df.columns:
-                    values = df["width_mm"].values
-                else:
-                    values = df.select_dtypes(include=[np.number]).iloc[:, -1].values
-            else:
-                values = np.loadtxt(measurements_path)
-            all_samples.append((measurements_path, values))
-        except Exception as e:
-            click.echo(f"Error loading {measurements_path}: {e}", err=True)
-            sys.exit(1)
-
-    # Build matcher
     try:
-        matcher = CrossdateMatcher(reference_dir=reference_dir)
-        if len(matcher.index) == 0:
-            click.echo("No reference chronologies found. Run 'dendro download' first.", err=True)
-            sys.exit(1)
-        click.echo(f"Loaded {len(matcher.index)} reference chronologies")
-    except Exception as e:
-        click.echo(f"Error loading references: {e}", err=True)
-        sys.exit(1)
+        matcher = CrossdateMatcher(reference_dir=reference_dir, allow_remote_metadata=True)
+    except Exception as exc:
+        click.echo(f"Error loading references: {exc}", err=True)
+        raise SystemExit(1)
 
-    # Multi-sample cross-verification mode
-    if cross_verify and len(all_samples) > 1:
-        _run_cross_verify(
-            samples=all_samples,
-            matcher=matcher,
-            species_filter=species_filter,
-            state_filter=state_filter,
-            era_start=era_start,
-            era_end=era_end,
-            bark_edge=bark_edge,
-            output=output,
-            plot=plot,
+    if len(matcher.index) == 0:
+        click.echo("No reference chronologies found. Run 'dendro download' first.", err=True)
+        raise SystemExit(1)
+
+    reports: list[DatingReport] = []
+    loaded_samples: list[np.ndarray] = []
+    for measurement_path in measurements:
+        path = Path(measurement_path)
+        try:
+            values = _load_measurements(path)
+        except Exception as exc:
+            click.echo(f"Error loading {path}: {exc}", err=True)
+            raise SystemExit(1)
+
+        reports.append(
+            matcher.date_sample(
+                values=values,
+                sample_name=path.stem,
+                has_bark_edge=bark_edge,
+                orientation=orientation,
+                species_filter=species_filter,
+                state_filter=state_filter,
+                era_start=era_start,
+                era_end=era_end,
+                top_n=top,
+            )
         )
+        loaded_samples.append(values)
+
+    if cross_verify and len(reports) > 1:
+        payload = _cross_verify_payload(reports)
+        if output:
+            Path(output).write_text(json.dumps(payload, indent=2))
+        if json_output:
+            click.echo(json.dumps(payload, indent=2))
+        else:
+            _print_cross_verify(payload)
         return
 
-    # Single sample mode (or first sample if not cross-verify)
-    measurements_path, values = all_samples[0]
+    report = reports[0]
+    payload = report.to_dict()
 
-    click.echo(f"\nLoaded {len(values)} ring measurements from {measurements_path.name}")
-    click.echo(f"Reference directory: {reference_dir}")
-    click.echo(f"Search era: {era_start}-{era_end}")
-    click.echo(f"Bark edge: {'Yes' if bark_edge else 'No'}")
-    click.echo()
-
-    click.echo("Cross-dating...")
-
-    report = matcher.date_sample(
-        values=values,
-        sample_name=measurements_path.stem,
-        has_bark_edge=bark_edge,
-        species_filter=species_filter,
-        state_filter=state_filter,
-        era_start=era_start,
-        era_end=era_end,
-    )
-
-    # Display results
-    click.echo("\n" + "=" * 60)
-    click.echo("CROSS-DATING RESULTS")
-    click.echo("=" * 60)
-    click.echo(f"Sample: {report.sample_name}")
-    click.echo(f"Length: {report.sample_length} rings")
-    click.echo(f"Bark edge: {'Yes' if report.has_bark_edge else 'No'}")
-    click.echo()
-
-    if report.consensus_year:
-        click.echo(f"PROPOSED FELLING YEAR: {report.consensus_year}")
-        click.echo(f"Confidence: {report.consensus_confidence}")
-    else:
-        click.echo("No confident date could be determined.")
-
-    # Add stricter warnings for borderline t-values
-    if report.matches:
-        best = report.matches[0]
-        if 4.0 <= best.t_value < 5.0:
-            report.warnings.append(
-                f"CAUTION: Best t-value ({best.t_value:.1f}) is in borderline range (4-5). "
-                "This commonly produces spurious matches. Seek additional verification."
-            )
-        if best.t_value < 6.0 and report.consensus_confidence == "MEDIUM":
-            report.warnings.append(
-                "Professional standards recommend t≥6 for publication. "
-                "Consider longer sample or additional references."
-            )
-
-    if report.warnings:
-        click.echo("\nWarnings:")
-        for w in report.warnings:
-            click.echo(f"  ⚠ {w}")
-
-    if report.matches:
-        click.echo(f"\nTop {min(top, len(report.matches))} matches:")
-        click.echo("-" * 60)
-
-        for i, m in enumerate(report.matches[:top], 1):
-            click.echo(f"{i}. {m.reference_name} ({m.reference_species}, {m.reference_state})")
-            click.echo(f"   Felling year: {m.felling_year}")
-            click.echo(f"   Correlation: {m.correlation:.3f}, T-value: {m.t_value:.1f}")
-            click.echo(f"   Overlap: {m.overlap} years, Confidence: {m.confidence}")
-            click.echo()
-
-        # Show segment analysis for best match
-        if segments and report.matches[0].segment_correlations:
-            _display_segment_analysis(report.matches[0], report.consensus_year)
-
-        # Detect and display marker years
-        if markers and report.consensus_year:
-            _display_marker_years(values, report.consensus_year)
-
-    # Save results if requested
     if output:
         output_path = Path(output)
-        with open(output_path, "w") as f:
-            json.dump(report.to_dict(), f, indent=2)
-        click.echo(f"\nResults saved to {output_path}")
-
-    # Generate plots if requested
-    if plot and report.matches:
+        output_path.write_text(json.dumps(payload, indent=2))
+        if plot:
+            _generate_plots(report, matcher, loaded_samples[0], output_path.with_suffix(".png"))
+    elif plot and len(measurements) == 1:
         _generate_plots(
-            report=report,
-            values=values,
-            matcher=matcher,
-            output_path=Path(output) if output else measurements_path.with_suffix(".png"),
+            report,
+            matcher,
+            loaded_samples[0],
+            Path(measurements[0]).with_suffix(".diagnostic.png"),
         )
 
+    if json_output:
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    _print_report(report)
+
 
 @cli.command()
-@click.option(
-    "--reference", "-r",
-    type=click.Path(exists=True),
-    default=None,
-    help="Directory containing reference chronologies."
-)
-def info(reference: Optional[str]):
-    """
-    Show information about downloaded reference chronologies.
-
-    Displays statistics about available chronologies including
-    species, states, and time coverage.
-
-    Example:
-        dendro info
-    """
-    from ..reference.chronology_index import ChronologyIndex
-
+@click.option("--reference", "-r", type=click.Path(exists=True), default=None, help="Reference directory.")
+@click.option("--json", "json_output", is_flag=True, default=False, help="Print manifest summary as JSON.")
+def info(reference: Optional[str], json_output: bool):
+    """Show the indexed reference inventory and metadata coverage."""
     reference_dir = Path(reference) if reference else DEFAULT_DATA_DIR / "reference"
-
     if not reference_dir.exists():
-        click.echo(f"Reference directory not found: {reference_dir}")
-        click.echo("Run 'dendro download' to download chronologies.")
+        click.echo(f"Reference directory not found: {reference_dir}", err=True)
+        raise SystemExit(1)
+
+    index = ChronologyIndex(reference_dir, allow_remote_metadata=True)
+    payload = {
+        "reference_dir": str(reference_dir),
+        "entries": len(index),
+        "species": {species: len([entry for entry in index.entries if entry.species == species]) for species in index.get_species()},
+        "states": {state: len([entry for entry in index.entries if entry.state == state]) for state in index.get_states()},
+        "file_types": {
+            file_type: len([entry for entry in index.entries if entry.file_type == file_type])
+            for file_type in sorted({entry.file_type for entry in index.entries})
+        },
+        "missing_species": len([entry for entry in index.entries if not entry.species]),
+    }
+
+    if json_output:
+        click.echo(json.dumps(payload, indent=2))
         return
 
-    click.echo(f"Scanning {reference_dir}...")
-    index = ChronologyIndex(reference_dir)
-
-    if len(index) == 0:
-        click.echo("No chronologies found.")
-        click.echo("Run 'dendro download' to download chronologies.")
-        return
-
-    click.echo(f"\nFound {len(index)} chronology files")
-    click.echo()
-
-    # Species breakdown
-    species = index.get_species()
+    click.echo(f"Reference directory: {reference_dir}")
+    click.echo(f"Indexed entries: {payload['entries']}")
+    click.echo("File types:")
+    for file_type, count in payload["file_types"].items():
+        click.echo(f"  {file_type}: {count}")
     click.echo("Species:")
-    for sp in species:
-        count = len([e for e in index.entries if e.species == sp])
-        click.echo(f"  {sp}: {count} files")
-
-    # State breakdown
-    states = index.get_states()
-    click.echo("\nStates:")
-    for st in states:
-        count = len([e for e in index.entries if e.state == st])
-        click.echo(f"  {st}: {count} files")
-
-    # Time coverage
-    all_starts = [e.start_year for e in index.entries if e.start_year > 0]
-    all_ends = [e.end_year for e in index.entries if e.end_year > 0]
-
-    if all_starts and all_ends:
-        click.echo(f"\nTime coverage: {min(all_starts)} - {max(all_ends)}")
-
-    # Late 1700s coverage (relevant for historic NH houses)
-    late_1700s = [
-        e for e in index.entries
-        if e.start_year <= 1780 and e.end_year >= 1800
-    ]
-    click.echo(f"\nChronologies covering 1780-1800: {len(late_1700s)}")
+    if payload["species"]:
+        for species_name, count in payload["species"].items():
+            click.echo(f"  {species_name}: {count}")
+    else:
+        click.echo("  (none indexed)")
+    click.echo("States:")
+    for state_name, count in payload["states"].items():
+        click.echo(f"  {state_name}: {count}")
+    click.echo(f"Entries missing species metadata: {payload['missing_species']}")
 
 
 @cli.command()
-@click.argument("rwl_file", type=click.Path(exists=True))
-def parse(rwl_file: str):
-    """
-    Parse and display contents of a Tucson format file.
-
-    Useful for inspecting downloaded reference chronologies.
-
-    Example:
-        dendro parse data/reference/nh/nh001.rwl
-    """
-    from ..reference.tucson_parser import parse_rwl_file, parse_crn_file
-
-    filepath = Path(rwl_file)
-
+@click.argument("reference_file", type=click.Path(exists=True))
+def parse(reference_file: str):
+    """Parse a Tucson or measurement file and print a concise summary."""
+    filepath = Path(reference_file)
     try:
-        if ".crn" in filepath.name.lower() or "-crn-" in filepath.name.lower():
-            chron = parse_crn_file(filepath)
-            if chron:
-                click.echo(f"Site: {chron.site_id}")
-                click.echo(f"Species: {chron.species}")
-                click.echo(f"Years: {chron.start_year} - {chron.end_year} ({chron.length} years)")
-                if chron.latitude and chron.longitude:
-                    click.echo(f"Location: {chron.latitude:.2f}°N, {abs(chron.longitude):.2f}°W")
-            else:
-                click.echo("Could not parse CRN file.")
-        else:
+        if filepath.suffix.lower() == ".crn":
+            chronology = parse_crn_file(filepath)
+            if chronology is None:
+                click.echo("Could not parse chronology file.", err=True)
+                raise SystemExit(1)
+            click.echo(f"Site: {chronology.site_id}")
+            click.echo(f"Species: {chronology.species or '(unknown)'}")
+            click.echo(f"Years: {chronology.start_year}-{chronology.end_year}")
+            click.echo(f"Depth entries: {len(chronology.sample_depth)}")
+            return
+
+        if filepath.suffix.lower() == ".rwl":
             rwl = parse_rwl_file(filepath)
             click.echo(f"File: {filepath.name}")
             click.echo(f"Series: {len(rwl.series)}")
-            click.echo()
-
             for series_id, series in list(rwl.series.items())[:10]:
-                click.echo(f"  {series_id}: {series.start_year}-{series.end_year} "
-                          f"({series.length} years)")
-
+                click.echo(f"  {series_id}: {series.start_year}-{series.end_year} ({series.length} rings)")
             if len(rwl.series) > 10:
                 click.echo(f"  ... and {len(rwl.series) - 10} more series")
+            return
 
-    except Exception as e:
-        click.echo(f"Error parsing file: {e}", err=True)
-        sys.exit(1)
-
-
-def _display_segment_analysis(match, consensus_year: int):
-    """Display segment-by-segment correlation analysis."""
-    click.echo("\nSegment Analysis (50-year windows):")
-    click.echo("-" * 60)
-
-    seg_corrs = match.segment_correlations
-    if not seg_corrs:
-        click.echo("  (Sample too short for segment analysis)")
-        return
-
-    weak_segments = []
-    for start_idx, r, t in seg_corrs:
-        year = match.proposed_start_year + start_idx
-        year_end = year + 50
-
-        # Determine quality indicator
-        if t >= 6.0:
-            quality = "+++"
-        elif t >= 4.0:
-            quality = "++ "
-        elif t >= 3.5:
-            quality = "+  "
+        if filepath.suffix.lower() == ".json":
+            df = load_measurement_session(filepath)
         else:
-            quality = "!  "
-            weak_segments.append((year, year_end, r, t))
-
-        click.echo(f"  {quality} {year}-{year_end}: r={r:.3f}, t={t:.1f}")
-
-    if weak_segments:
-        click.echo("\n  ⚠ Weak segments detected (t<3.5):")
-        for year, year_end, r, t in weak_segments:
-            click.echo(f"    {year}-{year_end}: Check measurements in this region")
+            df = load_measurements_csv(filepath)
+        click.echo(f"Rows: {len(df)}")
+        click.echo(f"Columns: {', '.join(df.columns)}")
+        click.echo(df.head(5).to_string(index=False))
+    except Exception as exc:
+        click.echo(f"Error parsing file: {exc}", err=True)
+        raise SystemExit(1)
 
 
-def _display_marker_years(values: np.ndarray, proposed_start_year: int):
-    """Detect and display potential marker year matches."""
-    from ..visualization.plots import detect_marker_years, identify_known_markers, MARKER_YEARS
-
-    click.echo("\nMarker Year Analysis:")
-    click.echo("-" * 60)
-
-    # Detect anomalous rings
-    anomalies = detect_marker_years(values, threshold_sigma=2.0)
-
-    if not anomalies:
-        click.echo("  No strongly anomalous rings detected.")
-        return
-
-    # Check against known marker years
-    matches = identify_known_markers(anomalies, proposed_start_year)
-
-    if matches:
-        click.echo("  Known climate events matched:")
-        for year, sample_desc, known_event in matches:
-            click.echo(f"  ✓ {year}: {known_event}")
-            click.echo(f"    (Sample shows {sample_desc})")
-        click.echo("\n  Marker year alignment strengthens confidence in dating.")
+def _load_measurements(filepath: Path) -> np.ndarray:
+    if filepath.suffix.lower() == ".json":
+        df = load_measurement_session(filepath)
+    elif filepath.suffix.lower() == ".csv":
+        df = load_measurements_csv(filepath)
     else:
-        click.echo("  Anomalous rings detected but no known markers matched:")
-        for idx, z_score, desc in anomalies[:5]:
-            year = proposed_start_year + idx
-            click.echo(f"    Ring at year {year}: {desc} (z={z_score:.1f})")
+        values = np.loadtxt(filepath)
+        return np.asarray(values, dtype=np.float64)
 
-    # Also show which marker years should be in the sample
-    sample_end = proposed_start_year + len(values) - 1
-    expected_markers = [
-        (y, desc) for y, desc in MARKER_YEARS.items()
-        if proposed_start_year <= y <= sample_end
-    ]
-
-    if expected_markers:
-        click.echo(f"\n  Expected marker years in sample range ({proposed_start_year}-{sample_end}):")
-        for year, desc in sorted(expected_markers):
-            idx = year - proposed_start_year
-            if 0 <= idx < len(values):
-                ring_val = values[idx]
-                mean = np.mean(values)
-                std = np.std(values)
-                z = (ring_val - mean) / std if std > 0 else 0
-                status = "✓ narrow" if z < -1.5 else "? not anomalous"
-                click.echo(f"    {year}: {desc}")
-                click.echo(f"       Ring value z-score: {z:.1f} ({status})")
+    for preferred in ("width", "width_mm"):
+        if preferred in df.columns:
+            return np.asarray(df[preferred].values, dtype=np.float64)
+    raise ValueError("Could not locate a width column in the measurement file")
 
 
-def _run_cross_verify(
-    samples: list[tuple[Path, np.ndarray]],
-    matcher,
-    species_filter,
-    state_filter,
-    era_start: int,
-    era_end: int,
-    bark_edge: bool,
-    output: Optional[str],
-    plot: bool,
-):
-    """Run cross-verification across multiple samples."""
-    click.echo("\n" + "=" * 60)
-    click.echo("MULTI-SAMPLE CROSS-VERIFICATION")
+def _print_report(report: DatingReport):
     click.echo("=" * 60)
-    click.echo(f"Analyzing {len(samples)} samples for consistency...")
+    click.echo("ASSISTED DATING REPORT")
+    click.echo("=" * 60)
+    click.echo(f"Sample: {report.sample_name}")
+    click.echo(f"Rings: {report.sample_length}")
+    click.echo(f"Status: {report.status.upper()}")
+    click.echo(f"Chosen input orientation: {report.chosen_orientation}")
+    click.echo(f"Policy: {report.policy_version}")
     click.echo()
 
-    results = []
-    for path, values in samples:
-        report = matcher.date_sample(
-            values=values,
-            sample_name=path.stem,
-            has_bark_edge=bark_edge,
-            species_filter=species_filter,
-            state_filter=state_filter,
-            era_start=era_start,
-            era_end=era_end,
-        )
-        results.append((path, values, report))
-
-        # Brief summary per sample
-        if report.consensus_year:
-            click.echo(f"  {path.name}: {report.consensus_year} ({report.consensus_confidence})")
-        else:
-            click.echo(f"  {path.name}: No confident date")
-
-    click.echo()
-
-    # Check for consensus across samples
-    dated_results = [(p, v, r) for p, v, r in results if r.consensus_year]
-
-    if len(dated_results) < 2:
-        click.echo("⚠ Insufficient samples with confident dates for cross-verification.")
-        return
-
-    # Extract years from each sample
-    years = [r.consensus_year for _, _, r in dated_results]
-    unique_years = set(years)
-
-    click.echo("CROSS-VERIFICATION RESULTS")
-    click.echo("-" * 60)
-
-    if len(unique_years) == 1:
-        consensus_year = years[0]
-        click.echo(f"✓ STRONG AGREEMENT: All {len(dated_results)} samples date to {consensus_year}")
-        click.echo(f"  This significantly increases confidence in the dating.")
-
-        # Calculate combined statistics
-        total_t = sum(r.matches[0].t_value if r.matches else 0 for _, _, r in dated_results)
-        avg_t = total_t / len(dated_results)
-        click.echo(f"\n  Combined statistics:")
-        click.echo(f"    Samples agreeing: {len(dated_results)}/{len(results)}")
-        click.echo(f"    Average t-value: {avg_t:.1f}")
-
+    if report.best_candidate is None:
+        click.echo("No candidate alignments were produced.")
     else:
-        click.echo("⚠ DISAGREEMENT DETECTED")
-        click.echo("  Samples propose different felling years:")
-        for year in sorted(unique_years):
-            agreeing = [p.name for p, _, r in dated_results if r.consensus_year == year]
-            click.echo(f"    {year}: {', '.join(agreeing)}")
+        best = report.best_candidate
+        if report.status == "recommended":
+            label = "Recommended possible felling year" if report.bark_edge else "Recommended outer-ring year"
+        else:
+            label = "Top candidate outer-ring year"
+        click.echo(f"{label}: {best.outer_ring_year}")
+        click.echo(f"Reference: {best.reference_name} ({best.reference_species or 'unknown species'}, {best.reference_state or 'unknown state'})")
+        click.echo(f"Correlation: {best.correlation:.3f}")
+        click.echo(f"T-value: {best.t_value:.2f}")
+        click.echo(f"Composite score: {best.composite_score:.3f}")
+        click.echo()
 
-        click.echo("\n  Possible causes:")
-        click.echo("    - Samples from different trees/buildings")
-        click.echo("    - Missing rings in one or more samples")
-        click.echo("    - Measurement errors")
-        click.echo("    - One or more spurious matches")
+    if report.warnings:
+        click.echo("Warnings:")
+        for warning in report.warnings:
+            click.echo(f"  - {warning}")
+        click.echo()
 
-    # Geographic diversity check
-    if dated_results:
-        all_states = set()
-        for _, _, r in dated_results:
-            if r.matches:
-                for m in r.matches[:3]:
-                    all_states.add(m.reference_state)
-
-        if len(all_states) >= 3:
-            click.echo(f"\n✓ Geographic diversity: References from {len(all_states)} states agree")
-            click.echo(f"  States: {', '.join(sorted(all_states))}")
-
-    # Save combined results if requested
-    if output:
-        combined = {
-            "samples": [
-                {
-                    "name": p.name,
-                    "length": len(v),
-                    "consensus_year": r.consensus_year,
-                    "confidence": r.consensus_confidence,
-                    "top_match_t": r.matches[0].t_value if r.matches else None,
-                }
-                for p, v, r in results
-            ],
-            "cross_verification": {
-                "samples_agreeing": len([y for y in years if y == max(set(years), key=years.count)]),
-                "total_samples": len(results),
-                "unique_years_proposed": list(unique_years),
-                "agreement": len(unique_years) == 1,
-            }
-        }
-        output_path = Path(output)
-        with open(output_path, "w") as f:
-            json.dump(combined, f, indent=2)
-        click.echo(f"\nCombined results saved to {output_path}")
+    if report.candidates:
+        click.echo("Ranked candidates:")
+        for index, candidate in enumerate(report.candidates, 1):
+            click.echo(
+                f"{index}. {candidate.reference_name} "
+                f"[{candidate.reference_species or 'unknown'} {candidate.reference_state or '??'}] "
+                f"outer={candidate.outer_ring_year} "
+                f"score={candidate.composite_score:.3f} "
+                f"r={candidate.correlation:.3f} "
+                f"t={candidate.t_value:.2f}"
+            )
 
 
-def _generate_plots(report, values: np.ndarray, matcher, output_path: Path):
-    """Generate and save diagnostic plots."""
+def _cross_verify_payload(reports: list[DatingReport]) -> dict:
+    statuses = [report.status for report in reports]
+    best_years = [report.best_candidate.outer_ring_year for report in reports if report.best_candidate]
+    agreement = len(set(best_years)) == 1 if best_years else False
+    return {
+        "policy_version": reports[0].policy_version if reports else "",
+        "samples": [report.to_dict() for report in reports],
+        "summary": {
+            "statuses": statuses,
+            "best_outer_ring_years": best_years,
+            "agreement": agreement,
+        },
+    }
+
+
+def _print_cross_verify(payload: dict):
+    click.echo("=" * 60)
+    click.echo("CROSS-VERIFICATION SUMMARY")
+    click.echo("=" * 60)
+    for sample in payload["samples"]:
+        best = sample.get("best_candidate")
+        top_year = best["outer_ring_year"] if best else "n/a"
+        click.echo(f"{sample['sample']['name']}: {sample['status']} (top outer-ring year: {top_year})")
+    click.echo(f"Agreement: {payload['summary']['agreement']}")
+
+
+def _generate_plots(report: DatingReport, matcher: CrossdateMatcher, sample_values: np.ndarray, output_path: Path):
     from ..crossdating.detrend import detrend_series, standardize
-    from ..crossdating.correlator import sliding_correlation
     from ..visualization.plots import save_diagnostic_plots
 
-    if not report.matches:
-        click.echo("No matches to plot.")
+    best = report.best_candidate
+    if best is None:
         return
 
-    best_match = report.matches[0]
-
-    # Get the reference data
-    candidates = matcher.index.search(
-        species=None,
-        states=None,
-        min_year=best_match.proposed_start_year - 100,
-        max_year=best_match.proposed_end_year + 100,
-        min_overlap=30,
-    )
-
-    # Find the matching reference
-    ref_data = None
-    ref_start = None
-
-    for meta in candidates:
-        if meta.site_name == best_match.reference_name:
-            data = matcher.index.load_chronology(meta)
-            if data is not None:
-                from ..reference.tucson_parser import Chronology, RWLFile
-
-                if isinstance(data, Chronology):
-                    ref_values = data.values
-                    ref_start = data.start_year
-                    if np.mean(ref_values) > 500:
-                        ref_data = ref_values / 1000.0
-                    else:
-                        ref_data = standardize(ref_values)
-                elif isinstance(data, RWLFile):
-                    df = data.to_dataframe()
-                    ref_values = df.mean(axis=1).values
-                    ref_start = int(df.index.min())
-                    try:
-                        detrended, _ = detrend_series(ref_values)
-                        ref_data = standardize(detrended)
-                    except Exception:
-                        ref_data = standardize(ref_values)
-                break
-
-    if ref_data is None or ref_start is None:
-        click.echo("Could not load reference for plotting.")
+    entry = next((entry for entry in matcher.index.entries if entry.site_id == best.reference_id and entry.file_type == best.reference_file_type), None)
+    if entry is None or entry.master is None:
         return
 
-    # Standardize sample
-    try:
-        detrended, _ = detrend_series(values)
-        sample_std = standardize(detrended)
-    except Exception:
-        sample_std = standardize(values)
+    if report.chosen_orientation == "bark_to_pith":
+        sample_values = sample_values[::-1]
 
-    # Get correlation profile
-    all_correlations = sliding_correlation(
-        sample_std, ref_data, ref_start, min_overlap=30
-    )
-
-    # Generate plots
-    plot_path = output_path.with_suffix(".png")
+    detrended, _ = detrend_series(sample_values)
+    sample_std = standardize(detrended)
 
     save_diagnostic_plots(
         report=report,
         sample=sample_std,
-        reference=ref_data,
-        reference_start_year=ref_start,
-        output_path=plot_path,
-        all_correlations=all_correlations,
+        reference=entry.master_values,
+        reference_start_year=entry.master_start_year,
+        output_path=output_path,
     )
-
-    click.echo(f"Diagnostic plots saved to {plot_path}")
 
 
 def main():
-    """Entry point for the CLI."""
     cli()
 
 

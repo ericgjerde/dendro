@@ -15,6 +15,7 @@ Format specification:
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -405,9 +406,12 @@ def load_measurements_csv(filepath: str | Path) -> pd.DataFrame:
 
     # Handle width column
     if "width" not in df.columns:
+        if "width_mm" in df.columns:
+            df = df.rename(columns={"width_mm": "width"})
+            return df[[col for col in ["year", "calendar_year", "ring_index", "width"] if col in df.columns]].dropna(subset=["width"])
         # Find the first non-year numeric column
         for col in df.columns:
-            if col != "year" and df[col].dtype in [np.int64, np.float64]:
+            if col not in {"year", "calendar_year", "ring_index"} and df[col].dtype in [np.int64, np.float64]:
                 df = df.rename(columns={col: "width"})
                 break
 
@@ -415,4 +419,22 @@ def load_measurements_csv(filepath: str | Path) -> pd.DataFrame:
     if "width" not in df.columns:
         raise ValueError("Could not identify ring width column in CSV")
 
-    return df[["year", "width"]].dropna()
+    keep = [col for col in ["year", "calendar_year", "ring_index", "width"] if col in df.columns]
+    if "year" not in keep:
+        df["year"] = range(1, len(df) + 1)
+        keep = [col for col in ["year", "calendar_year", "ring_index", "width"] if col in df.columns]
+    return df[keep].dropna(subset=["width"])
+
+
+def load_measurement_session(filepath: str | Path) -> pd.DataFrame:
+    """Load canonical widths from a saved measurement session JSON file."""
+    payload = json.loads(Path(filepath).read_text())
+    widths = payload.get("exported_widths_mm_oldest_to_newest", [])
+    if not widths:
+        raise ValueError("Measurement session does not contain exported widths")
+    return pd.DataFrame(
+        {
+            "ring_index": range(1, len(widths) + 1),
+            "width": widths,
+        }
+    )

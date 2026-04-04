@@ -1,3 +1,3 @@
-"""Dendrochronology dating tool for historic timber analysis."""
+"""Public Northeast-first assisted dendrochronology CLI."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

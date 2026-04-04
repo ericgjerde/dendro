@@ -1,0 +1,41 @@
+{
+  "name": "validated_northeast_v1",
+  "description": "Curated Northeast leave-one-file-out benchmark suite used for release gating in v1.",
+  "cases": [
+    {
+      "label": "CT001 BP10N",
+      "test_file": "data/reference/ct/ct001.rwl",
+      "series_id": "BP10N",
+      "expected_outer_ring_year": 1985,
+      "exclude_file": true
+    },
+    {
+      "label": "CT002 NF12NE",
+      "test_file": "data/reference/ct/ct002.rwl",
+      "series_id": "NF12NE",
+      "expected_outer_ring_year": 1985,
+      "exclude_file": true
+    },
+    {
+      "label": "NH001 297031",
+      "test_file": "data/reference/nh/nh001.rwl",
+      "series_id": "297031",
+      "expected_outer_ring_year": 1971,
+      "exclude_file": true
+    },
+    {
+      "label": "NH003 078011",
+      "test_file": "data/reference/nh/nh003.rwl",
+      "series_id": "078011",
+      "expected_outer_ring_year": 1979,
+      "exclude_file": true
+    },
+    {
+      "label": "NY012 117121",
+      "test_file": "data/reference/ny/ny012.rwl",
+      "series_id": "117121",
+      "expected_outer_ring_year": 1984,
+      "exclude_file": true
+    }
+  ]
+}

@@ -1,10 +1,10 @@
 [project]
 name = "dendro"
-version = "0.1.0"
-description = "Dendrochronology dating tool for historic timber analysis"
+version = "0.2.0"
+description = "Northeast-first assisted dendrochronology CLI for ranked ITRDB dating workflows"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "dendro contributors"}
 ]

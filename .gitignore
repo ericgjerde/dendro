@@ -41,8 +41,9 @@ htmlcov/
 .nox/
 
 # Data directories (user data, not tracked)
-data/reference/
+data/reference/*
 data/samples/
+!data/reference/.dendro-reference-manifest.json
 
 # Jupyter
 .ipynb_checkpoints/
@@ -60,5 +61,11 @@ Thumbs.db
 !tests/fixtures/*
 
 # Development workflow tracking
-.beads/
+.beads/*
+!.beads/.gitignore
+!.beads/README.md
+!.beads/config.yaml
+!.beads/issues.jsonl
+!.beads/interactions.jsonl
+!.beads/metadata.json
 uv.lock

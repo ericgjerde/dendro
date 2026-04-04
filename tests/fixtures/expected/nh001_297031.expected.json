@@ -1,0 +1,12 @@
+{
+  "status": "recommended",
+  "sample": {
+    "chosen_orientation": "oldest_to_newest"
+  },
+  "best_candidate": {
+    "outer_ring_year": 1971,
+    "reference_name": "Nancy Brook",
+    "reference_species": "PCRU",
+    "reference_state": "NH"
+  }
+}

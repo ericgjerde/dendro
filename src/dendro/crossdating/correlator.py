@@ -87,6 +87,8 @@ def sliding_correlation(
 
         # Calculate correlation
         corr, p_value = stats.pearsonr(sample_valid, ref_valid)
+        if np.isnan(corr):
+            continue
 
         # Calculate t-value
         t_val = calculate_tvalue(corr, n_valid)
@@ -165,13 +167,9 @@ def calculate_gleichlauf(series1: np.ndarray, series2: np.ndarray) -> float:
     sign2 = np.sign(diff2)
 
     n = len(diff1)
-    agreements = np.sum(sign1 == sign2)
-
-    # Count cases where one or both are zero (half weight)
+    agreements = np.sum((sign1 == sign2) & (sign1 != 0))
     zeros = np.sum((sign1 == 0) | (sign2 == 0))
-
-    # Adjusted GLK
-    glk = 100 * (agreements - zeros * 0.5 + zeros * 0.5) / n
+    glk = 100 * (agreements + zeros * 0.5) / n
 
     return glk
 

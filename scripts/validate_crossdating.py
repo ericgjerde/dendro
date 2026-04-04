@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Validate cross-dating algorithm using known-date ITRDB samples.
+Benchmark the assisted-ranking pipeline with known-date ITRDB samples.
 
-This script takes a real tree ring series with a known date, "forgets" the date,
-and attempts to recover it through cross-dating. This validates that the
-algorithm works correctly before using it on unknown samples.
+This script removes the known date from a real tree-ring series and checks
+whether the ranking pipeline recovers the correct outer-ring year against the
+current reference inventory. It supports both an exploratory discovery mode
+(`--num-tests`) and a deterministic curated benchmark suite (`--suite-file`).
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -16,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import numpy as np
 from dendro.reference.tucson_parser import parse_rwl_file
 from dendro.reference.chronology_index import ChronologyIndex
+from dendro.reference.metadata import resolve_reference_metadata
 from dendro.crossdating.matcher import CrossdateMatcher
 from dendro.crossdating.detrend import DetrendMethod
 
@@ -25,6 +28,7 @@ def validate_with_known_sample(
     series_id: str,
     reference_dir: str,
     exclude_file: bool = True,
+    expected_outer_ring_year: int | None = None,
 ):
     """
     Validate cross-dating by testing a known-date sample.
@@ -51,9 +55,12 @@ def validate_with_known_sample(
     test_series = rwl.series[series_id]
     true_start = test_series.start_year
     true_end = test_series.end_year
+    target_end = expected_outer_ring_year if expected_outer_ring_year is not None else true_end
 
     print(f"Test series: {series_id}")
     print(f"TRUE DATE: {true_start} - {true_end} ({test_series.length} years)")
+    if expected_outer_ring_year is not None and expected_outer_ring_year != true_end:
+        print(f"Expected outer-ring year override: {expected_outer_ring_year}")
     print(f"\nNow 'forgetting' the date and attempting to recover it...")
 
     # Get the ring width values (this is all we'd have from an unknown sample)
@@ -81,6 +88,9 @@ def validate_with_known_sample(
                 index._by_state[entry.state].append(entry)
         print(f"Excluded source file. Using {len(index.entries)}/{original_count} reference files.")
 
+    metadata = resolve_reference_metadata(test_file, "rwl", allow_remote=True)
+    species_filter = [metadata.species] if metadata.species else None
+
     # Run cross-dating
     matcher = CrossdateMatcher(index=index)
 
@@ -89,12 +99,15 @@ def validate_with_known_sample(
     search_end = true_end + 50
 
     print(f"Searching for match in era {search_start}-{search_end}...")
+    if species_filter:
+        print(f"Using species filter: {species_filter[0]}")
     print()
 
     report = matcher.date_sample(
         values=values,
         sample_name=series_id,
         has_bark_edge=True,
+        species_filter=species_filter,
         era_start=search_start,
         era_end=search_end,
         min_overlap=30,
@@ -113,16 +126,19 @@ def validate_with_known_sample(
     recovered_end = best_match.felling_year
     recovered_start = best_match.proposed_start_year
 
-    error = recovered_end - true_end
+    error = recovered_end - target_end
 
-    print(f"\nTRUE END YEAR:      {true_end}")
+    print(f"\nTARGET END YEAR:    {target_end}")
+    if target_end != true_end:
+        print(f"TRUE END YEAR:      {true_end}")
     print(f"RECOVERED END YEAR: {recovered_end}")
     print(f"ERROR:              {error:+d} years")
     print()
     print(f"Best match: {best_match.reference_name}")
     print(f"Correlation: {best_match.correlation:.3f}")
     print(f"T-value: {best_match.t_value:.1f}")
-    print(f"Confidence: {best_match.confidence}")
+    print(f"Status: {report.status}")
+    print(f"Composite score: {best_match.composite_score:.3f}")
 
     if report.warnings:
         print(f"\nWarnings:")
@@ -133,7 +149,7 @@ def validate_with_known_sample(
     print(f"\nTop 5 matches:")
     print("-" * 60)
     for i, m in enumerate(report.matches[:5], 1):
-        match_error = m.felling_year - true_end
+        match_error = m.felling_year - target_end
         marker = "<<<" if match_error == 0 else ""
         print(f"{i}. {m.reference_name}: {m.felling_year} (error: {match_error:+d}) "
               f"r={m.correlation:.3f} t={m.t_value:.1f} {marker}")
@@ -150,6 +166,65 @@ def validate_with_known_sample(
     else:
         print(f"FAILED: Off by {abs(error)} years")
         return False
+
+
+def _resolve_case_path(case_path: str, suite_file: Path) -> Path:
+    path = Path(case_path)
+    if path.is_absolute() or path.exists():
+        return path
+
+    suite_relative = suite_file.parent / path
+    if suite_relative.exists():
+        return suite_relative
+
+    return path
+
+
+def run_benchmark_suite(reference_dir: str, suite_file: str):
+    """Run a deterministic curated benchmark suite."""
+    suite_path = Path(suite_file)
+    payload = json.loads(suite_path.read_text())
+    cases = payload.get("cases", [])
+
+    print("\n" + "=" * 60)
+    print(f"RUNNING BENCHMARK SUITE: {payload.get('name', suite_path.stem)}")
+    print("=" * 60)
+    if payload.get("description"):
+        print(payload["description"])
+    print(f"Cases: {len(cases)}\n")
+
+    results = []
+    for index, case in enumerate(cases, 1):
+        test_file = _resolve_case_path(case["test_file"], suite_path)
+        series_id = case["series_id"]
+        label = case.get("label", f"{test_file.name}/{series_id}")
+        expected_outer_ring_year = case.get("expected_outer_ring_year")
+
+        print(f"\n{'#' * 60}")
+        print(f"CASE {index}/{len(cases)}: {label}")
+        print(f"{'#' * 60}")
+
+        success = validate_with_known_sample(
+            test_file=str(test_file),
+            series_id=series_id,
+            reference_dir=reference_dir,
+            exclude_file=case.get("exclude_file", True),
+            expected_outer_ring_year=expected_outer_ring_year,
+        )
+        results.append((label, expected_outer_ring_year, success))
+
+    print("\n" + "=" * 60)
+    print("BENCHMARK SUITE SUMMARY")
+    print("=" * 60)
+    successes = sum(1 for _, _, success in results if success)
+    print(f"\nPassed: {successes}/{len(results)}")
+
+    for label, expected_outer_ring_year, success in results:
+        status = "PASS" if success else "FAIL"
+        expected_text = f" (expected outer-ring year: {expected_outer_ring_year})" if expected_outer_ring_year else ""
+        print(f"  [{status}] {label}{expected_text}")
+
+    return successes == len(results)
 
 
 def run_multiple_validations(reference_dir: str, num_tests: int = 5):
@@ -225,13 +300,17 @@ def run_multiple_validations(reference_dir: str, num_tests: int = 5):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Validate cross-dating algorithm")
+    parser = argparse.ArgumentParser(description="Validate the assisted-ranking cross-dating pipeline")
     parser.add_argument("--reference-dir", "-r", default="data/reference",
                        help="Directory containing reference chronologies")
     parser.add_argument("--test-file", "-f", help="Specific RWL file to test")
     parser.add_argument("--series-id", "-s", help="Specific series ID to test")
+    parser.add_argument(
+        "--suite-file",
+        help="JSON benchmark suite file describing deterministic validation cases",
+    )
     parser.add_argument("--num-tests", "-n", type=int, default=5,
-                       help="Number of validation tests to run")
+                       help="Number of exploratory discovery-mode validation tests to run")
 
     args = parser.parse_args()
 
@@ -241,6 +320,11 @@ if __name__ == "__main__":
             test_file=args.test_file,
             series_id=args.series_id,
             reference_dir=args.reference_dir,
+        )
+    elif args.suite_file:
+        success = run_benchmark_suite(
+            reference_dir=args.reference_dir,
+            suite_file=args.suite_file,
         )
     else:
         # Run multiple automatic tests

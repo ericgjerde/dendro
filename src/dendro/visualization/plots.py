@@ -312,8 +312,9 @@ def plot_crossdate_results(
 
     fig.suptitle(
         f"Cross-Dating Results: {report.sample_name}\n"
-        f"Proposed Year: {report.consensus_year or 'N/A'} | "
-        f"Confidence: {report.consensus_confidence}",
+        f"Top Outer-Ring Year: "
+        f"{(report.best_candidate.outer_ring_year if report.best_candidate else 'N/A')} | "
+        f"Status: {report.status.upper()}",
         fontsize=14, fontweight='bold'
     )
 
