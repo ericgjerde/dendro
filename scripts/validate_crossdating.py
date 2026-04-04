@@ -9,6 +9,7 @@ current reference inventory. It supports both an exploratory discovery mode
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from dendro.reference.tucson_parser import parse_rwl_file
 from dendro.reference.chronology_index import ChronologyIndex
 from dendro.reference.metadata import resolve_reference_metadata
 from dendro.crossdating.matcher import CrossdateMatcher
+from dendro.crossdating.benchmark import sweep_corpus, summarize_corpus_results
 from dendro.crossdating.detrend import DetrendMethod
 
 
@@ -297,6 +299,84 @@ def run_multiple_validations(reference_dir: str, num_tests: int = 5):
     return successes == len(results)
 
 
+def run_corpus_analysis(
+    reference_dir: str,
+    *,
+    scope: str,
+    curated_suite_file: str | None,
+    output_json: str | None,
+    top_n: int,
+    workers: int,
+):
+    """Run a structured sweep across the bundled corpus."""
+    results = sweep_corpus(
+        reference_dir,
+        scope=scope,
+        curated_suite_file=curated_suite_file,
+        top_n=top_n,
+        progress_every=50 if scope == "all" else 0,
+        max_workers=workers,
+    )
+    payload = {
+        "reference_dir": str(Path(reference_dir).resolve()),
+        "scope": scope,
+        "top_n": int(top_n),
+        "results": [result.to_dict() for result in results],
+        "summary": summarize_corpus_results(results),
+    }
+
+    if output_json:
+        Path(output_json).write_text(json.dumps(payload, indent=2))
+
+    overall = payload["summary"]["overall"]
+    print("\n" + "=" * 60)
+    print("CORPUS SWEEP SUMMARY")
+    print("=" * 60)
+    print(f"Cases: {overall['count']}")
+    print(
+        "Top-1 within ±2 years: "
+        f"{overall['top1_within_2_years']}/{overall['count']} "
+        f"({overall['top1_within_2_years_rate']:.1%})"
+    )
+    print(
+        "Top-5 contains correct year: "
+        f"{overall['top5_within_2_years']}/{overall['count']} "
+        f"({overall['top5_within_2_years_rate']:.1%})"
+    )
+    print(
+        "Correct and recommended: "
+        f"{overall['recommended']}/{overall['count']} "
+        f"({overall['recommended_rate']:.1%})"
+    )
+    print(
+        "No matches: "
+        f"{overall['no_match']}/{overall['count']} "
+        f"({overall['no_match_rate']:.1%})"
+    )
+    print()
+    print("Failure categories:")
+    for category, count in sorted(payload["summary"]["category_counts"].items()):
+        print(f"  {category}: {count}")
+    print()
+    print("Top likely-cause labels:")
+    for cause, count in sorted(
+        payload["summary"]["likely_cause_counts"].items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:10]:
+        print(f"  {cause}: {count}")
+    print()
+    print("Representative failures:")
+    for item in payload["summary"]["representative_failures"][:10]:
+        print(
+            f"  {Path(item['test_file']).name}/{item['series_id']}: "
+            f"error={item['top1_error']} category={item['category']} "
+            f"reference={item['top1_reference_name']}"
+        )
+
+    return payload
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -308,6 +388,33 @@ if __name__ == "__main__":
     parser.add_argument(
         "--suite-file",
         help="JSON benchmark suite file describing deterministic validation cases",
+    )
+    parser.add_argument(
+        "--corpus-sweep",
+        action="store_true",
+        help="Run a structured leave-one-file-out sweep across the bundled corpus",
+    )
+    parser.add_argument(
+        "--scope",
+        default="representative",
+        choices=["representative", "all"],
+        help="Corpus sweep scope: one representative series per file or all eligible series",
+    )
+    parser.add_argument(
+        "--output-json",
+        help="Write structured corpus sweep output to this JSON file",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=20,
+        help="Number of ranked candidates to retain in corpus sweep mode",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(8, os.cpu_count() or 1)),
+        help="Worker processes to use in corpus sweep mode",
     )
     parser.add_argument("--num-tests", "-n", type=int, default=5,
                        help="Number of exploratory discovery-mode validation tests to run")
@@ -321,6 +428,16 @@ if __name__ == "__main__":
             series_id=args.series_id,
             reference_dir=args.reference_dir,
         )
+    elif args.corpus_sweep:
+        run_corpus_analysis(
+            reference_dir=args.reference_dir,
+            scope=args.scope,
+            curated_suite_file=args.suite_file,
+            output_json=args.output_json,
+            top_n=args.top_n,
+            workers=args.workers,
+        )
+        success = True
     elif args.suite_file:
         success = run_benchmark_suite(
             reference_dir=args.reference_dir,
