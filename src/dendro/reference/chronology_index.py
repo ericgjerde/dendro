@@ -13,6 +13,7 @@ import numpy as np
 
 from ..crossdating.detrend import DetrendMethod, build_chronology, detrend_series, standardize
 from .metadata import resolve_reference_metadata
+from .curated import CuratedChronology, parse_curated_chronology_file
 from .tucson_parser import Chronology, RWLFile, parse_crn_file, parse_rwl_file
 
 
@@ -56,6 +57,7 @@ class ReferenceManifestEntry:
     num_years: int
     num_series: int
     file_type: str
+    material_group: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     elevation: Optional[float] = None
@@ -111,6 +113,7 @@ class ChronologyIndex:
         self.entries: list[ReferenceManifestEntry] = []
         self._by_species: dict[str, list[ReferenceManifestEntry]] = {}
         self._by_state: dict[str, list[ReferenceManifestEntry]] = {}
+        self._by_material_group: dict[str, list[ReferenceManifestEntry]] = {}
         self.data_dir: Optional[Path] = Path(data_dir).resolve() if data_dir is not None else None
         self.manifest_name = manifest_name
 
@@ -152,7 +155,7 @@ class ChronologyIndex:
             if not filepath.is_file():
                 continue
             name = filepath.name.lower()
-            if name.endswith(".rwl") or name.endswith(".crn"):
+            if name.endswith(".rwl") or name.endswith(".crn") or (name.endswith(".json") and name != MANIFEST_FILENAME):
                 if "-noaa." in name:
                     continue
                 files.append(filepath)
@@ -163,6 +166,7 @@ class ChronologyIndex:
         self.entries = []
         self._by_species = {}
         self._by_state = {}
+        self._by_material_group = {}
 
         if not data_dir.exists():
             return 0
@@ -183,6 +187,44 @@ class ChronologyIndex:
         *,
         allow_remote_metadata: bool = False,
     ) -> Optional[ReferenceManifestEntry]:
+        name = filepath.name.lower()
+        if filepath.suffix.lower() == ".json" and name != MANIFEST_FILENAME:
+            curated = parse_curated_chronology_file(filepath)
+            if curated is None:
+                return None
+            warnings = list(curated.warnings)
+            master = MasterChronology(
+                start_year=curated.start_year,
+                end_year=curated.end_year,
+                values=np.asarray(curated.values, dtype=np.float64).tolist(),
+                sample_depth=np.asarray(curated.sample_depth, dtype=np.int32).tolist(),
+                build_method=curated.build_method,
+                detrend_method=curated.detrend_method,
+                standardized=curated.standardized,
+            )
+            site_name = curated.site_name or filepath.stem
+            return ReferenceManifestEntry(
+                filepath=str(filepath),
+                site_id=curated.site_id or filepath.stem[:8].upper(),
+                site_name=site_name,
+                species=curated.species,
+                state=curated.state,
+                start_year=curated.start_year,
+                end_year=curated.end_year,
+                num_years=curated.length,
+                num_series=max(1, int(np.nanmax(curated.sample_depth)) if len(curated.sample_depth) else 1),
+                file_type="curated_json",
+                material_group=curated.material_group,
+                latitude=curated.latitude,
+                longitude=curated.longitude,
+                elevation=curated.elevation,
+                provenance_url=curated.provenance_url,
+                study_metadata_url=curated.study_metadata_url,
+                metadata_source=curated.source,
+                parser_warnings=warnings,
+                master=master,
+            )
+
         file_type = "crn" if filepath.suffix.lower() == ".crn" else "rwl"
         resolved = resolve_reference_metadata(filepath, file_type, allow_remote=allow_remote_metadata)
 
@@ -227,6 +269,7 @@ class ChronologyIndex:
             num_years=num_years,
             num_series=num_series,
             file_type=file_type,
+            material_group="",
             latitude=resolved.latitude,
             longitude=resolved.longitude,
             elevation=resolved.elevation,
@@ -318,11 +361,14 @@ class ChronologyIndex:
             self._by_species.setdefault(entry.species, []).append(entry)
         if entry.state:
             self._by_state.setdefault(entry.state, []).append(entry)
+        if entry.material_group:
+            self._by_material_group.setdefault(entry.material_group, []).append(entry)
 
     def search(
         self,
         species: Optional[list[str]] = None,
         states: Optional[list[str]] = None,
+        material_groups: Optional[list[str]] = None,
         min_year: Optional[int] = None,
         max_year: Optional[int] = None,
         min_overlap: int = 30,
@@ -338,6 +384,10 @@ class ChronologyIndex:
         if states:
             states = [s.upper() for s in states]
             candidates = [entry for entry in candidates if entry.state in states]
+
+        if material_groups:
+            material_groups = [group.lower() for group in material_groups]
+            candidates = [entry for entry in candidates if entry.material_group in material_groups]
 
         if file_type:
             candidates = [entry for entry in candidates if entry.file_type == file_type]
@@ -370,8 +420,13 @@ class ChronologyIndex:
     def get_states(self) -> list[str]:
         return sorted(self._by_state.keys())
 
-    def load_chronology(self, metadata: ReferenceManifestEntry) -> Chronology | RWLFile | None:
+    def get_material_groups(self) -> list[str]:
+        return sorted(self._by_material_group.keys())
+
+    def load_chronology(self, metadata: ReferenceManifestEntry) -> Chronology | CuratedChronology | RWLFile | None:
         filepath = Path(metadata.filepath)
+        if metadata.file_type == "curated_json":
+            return parse_curated_chronology_file(filepath)
         if metadata.file_type == "crn":
             return parse_crn_file(filepath)
         return parse_rwl_file(filepath)
@@ -402,6 +457,10 @@ class ChronologyIndex:
         refreshed_entries: list[ReferenceManifestEntry] = []
 
         for entry in self.entries:
+            if entry.file_type not in {"rwl", "crn"}:
+                refreshed_entries.append(entry)
+                continue
+
             if entry.species and entry.site_name and entry.site_name != Path(entry.filepath).stem:
                 refreshed_entries.append(entry)
                 continue
@@ -434,6 +493,7 @@ class ChronologyIndex:
             self.entries = []
             self._by_species = {}
             self._by_state = {}
+            self._by_material_group = {}
             for entry in refreshed_entries:
                 self._add_entry(entry)
         return enriched
