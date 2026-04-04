@@ -19,6 +19,37 @@ from ..reference.chronology_index import ChronologyIndex, ReferenceManifestEntry
 
 POLICY_VERSION = "2026.04-assisted-ranking-v1"
 YEAR_CONSENSUS_WINDOW = 2
+SPARSE_REFERENCE_WARNING_THRESHOLD = 8
+SPARSE_REFERENCE_FORCE_BROAD_SEARCH_THRESHOLD = 3
+GENUS_FALLBACK_MIN_REFERENCES = 8
+GENUS_FALLBACK_MIN_STATES = 2
+GENUS_FALLBACK_PENALTY = 0.025
+BROAD_FALLBACK_PENALTY = 0.04
+SUPPORTED_GENUS_FALLBACKS = {"PI", "QU"}
+
+
+@dataclass
+class SearchLane:
+    """A single reference search lane used during candidate ranking."""
+
+    name: str
+    entries: list[ReferenceManifestEntry]
+    lane_penalty: float = 0.0
+    species_filter: Optional[list[str]] = None
+    rationale: str = ""
+    fallback: bool = False
+
+
+@dataclass
+class SearchPlan:
+    """Resolved search lanes and diagnostics for a dating run."""
+
+    lanes: list[SearchLane]
+    reference_count: int
+    combined_reference_count: int
+    recommendation_blocked: bool = False
+    warnings: list[str] = field(default_factory=list)
+    diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -44,6 +75,8 @@ class DatingCandidate:
     year_cluster_support: int = 1
     year_cluster_unique_families: int = 1
     year_cluster_bonus: float = 0.0
+    search_lane: str = "species_primary"
+    search_lane_penalty: float = 0.0
     is_recommended: bool = False
     rationale: list[str] = field(default_factory=list)
 
@@ -85,6 +118,8 @@ class DatingCandidate:
             "year_cluster_support": int(self.year_cluster_support),
             "year_cluster_unique_families": int(self.year_cluster_unique_families),
             "year_cluster_bonus": float(round(self.year_cluster_bonus, 4)),
+            "search_lane": self.search_lane,
+            "search_lane_penalty": float(round(self.search_lane_penalty, 4)),
             "is_recommended": bool(self.is_recommended),
             "rationale": list(self.rationale),
             "segment_correlations": [
@@ -209,6 +244,8 @@ class CrossdateMatcher:
     ) -> DatingReport:
         values = np.asarray(values, dtype=np.float64)
         warnings: list[str] = []
+        requested_species = [code.upper() for code in species_filter] if species_filter else None
+        requested_states = [code.upper() for code in state_filter] if state_filter else None
 
         if len(values) < 10:
             warnings.append("Sample too short for assisted ranking. Minimum 10 rings required.")
@@ -228,15 +265,17 @@ class CrossdateMatcher:
                 },
             )
 
-        candidates = self.index.search(
-            species=species_filter,
-            states=state_filter,
+        search_plan = self._build_search_plan(
+            species_filter=requested_species,
+            state_filter=requested_states,
             min_year=era_start - len(values),
             max_year=era_end,
             min_overlap=min_overlap,
+            max_references=max_references,
         )
+        warnings.extend(search_plan.warnings)
 
-        if not candidates:
+        if not search_plan.lanes:
             warnings.append("No reference chronologies matched the requested filters and era.")
             return self._build_report(
                 sample_name=sample_name,
@@ -249,12 +288,12 @@ class CrossdateMatcher:
                 warnings=warnings,
                 diagnostics={
                     "detrend_method": detrend_method.value,
-                    "reference_count": 0,
+                    "reference_count": int(search_plan.reference_count),
+                    "combined_reference_count": int(search_plan.combined_reference_count),
                     "min_overlap": min_overlap,
+                    **search_plan.diagnostics,
                 },
             )
-
-        candidates = candidates[:max_references]
 
         orientation_runs = self._resolve_orientations(values, orientation)
         best_run: Optional[tuple[str, list[DatingCandidate], np.ndarray]] = None
@@ -270,13 +309,13 @@ class CrossdateMatcher:
             ranked_candidates = self._rank_candidates(
                 sample_std=sample_std,
                 bark_edge=has_bark_edge,
-                candidates=candidates,
+                search_lanes=search_plan.lanes,
                 era_start=era_start,
                 era_end=era_end,
                 min_overlap=min_overlap,
                 top_n=top_n,
-                species_filter=species_filter,
-                state_filter=state_filter,
+                species_filter=requested_species,
+                state_filter=requested_states,
             )
 
             if best_run is None:
@@ -301,12 +340,19 @@ class CrossdateMatcher:
                 warnings=warnings,
                 diagnostics={
                     "detrend_method": detrend_method.value,
-                    "reference_count": len(candidates),
+                    "reference_count": int(search_plan.reference_count),
+                    "combined_reference_count": int(search_plan.combined_reference_count),
                     "min_overlap": min_overlap,
+                    **search_plan.diagnostics,
                 },
             )
 
         chosen_orientation, ranked_candidates, sample_std = best_run
+        if ranked_candidates:
+            ranked_candidates[0].is_recommended = self._is_recommended(
+                ranked_candidates[0],
+                recommendation_blocked=search_plan.recommendation_blocked,
+            )
         status = self._determine_status(ranked_candidates, warnings)
 
         if status == "ranked" and ranked_candidates:
@@ -328,11 +374,13 @@ class CrossdateMatcher:
             warnings=warnings,
             diagnostics={
                 "detrend_method": detrend_method.value,
-                "reference_count": len(candidates),
+                "reference_count": int(search_plan.reference_count),
+                "combined_reference_count": int(search_plan.combined_reference_count),
                 "min_overlap": int(min_overlap),
                 "top_score": float(ranked_candidates[0].composite_score) if ranked_candidates else None,
                 "top_correlation": float(ranked_candidates[0].correlation) if ranked_candidates else None,
                 "top_t_value": float(ranked_candidates[0].t_value) if ranked_candidates else None,
+                **search_plan.diagnostics,
             },
         )
 
@@ -350,12 +398,246 @@ class CrossdateMatcher:
             ("bark_to_pith", values[::-1]),
         ]
 
+    def _build_search_plan(
+        self,
+        *,
+        species_filter: Optional[list[str]],
+        state_filter: Optional[list[str]],
+        min_year: int,
+        max_year: int,
+        min_overlap: int,
+        max_references: int,
+    ) -> SearchPlan:
+        warnings: list[str] = []
+        lanes: list[SearchLane] = []
+        lane_summaries: list[dict] = []
+
+        if not species_filter:
+            entries = self.index.search(
+                states=state_filter,
+                min_year=min_year,
+                max_year=max_year,
+                min_overlap=min_overlap,
+            )[:max_references]
+            if entries:
+                lanes.append(
+                    SearchLane(
+                        name="all_references",
+                        entries=entries,
+                        rationale="all-reference search lane",
+                    )
+                )
+                lane_summaries.append(
+                    {
+                        "name": "all_references",
+                        "reference_count": len(entries),
+                        "fallback": False,
+                        "lane_penalty": 0.0,
+                    }
+                )
+            return SearchPlan(
+                lanes=lanes,
+                reference_count=len(entries),
+                combined_reference_count=len(entries),
+                diagnostics={
+                    "search_strategy": "all_references",
+                    "search_lanes": lane_summaries,
+                    "sparse_reference_coverage": False,
+                },
+            )
+
+        primary_entries = self.index.search(
+            species=species_filter,
+            states=state_filter,
+            min_year=min_year,
+            max_year=max_year,
+            min_overlap=min_overlap,
+        )
+        primary_count = len(primary_entries)
+        sparse_coverage = primary_count < SPARSE_REFERENCE_WARNING_THRESHOLD
+
+        if primary_entries:
+            primary_lane_entries = primary_entries[:max_references]
+            lanes.append(
+                SearchLane(
+                    name="species_primary",
+                    entries=primary_lane_entries,
+                    species_filter=species_filter,
+                    rationale="same-species lane",
+                )
+            )
+            lane_summaries.append(
+                {
+                    "name": "species_primary",
+                    "reference_count": len(primary_lane_entries),
+                    "fallback": False,
+                    "lane_penalty": 0.0,
+                }
+            )
+
+        fallback_species: set[str] = set(species_filter)
+        if sparse_coverage:
+            genus_lane = self._build_genus_fallback_lane(
+                species_filter=species_filter,
+                state_filter=state_filter,
+                min_year=min_year,
+                max_year=max_year,
+                min_overlap=min_overlap,
+                max_references=max_references,
+            )
+            if genus_lane is not None:
+                lanes.append(genus_lane)
+                lane_summaries.append(
+                    {
+                        "name": genus_lane.name,
+                        "reference_count": len(genus_lane.entries),
+                        "fallback": True,
+                        "lane_penalty": genus_lane.lane_penalty,
+                    }
+                )
+                fallback_species.update(genus_lane.species_filter or [])
+
+            if primary_count <= SPARSE_REFERENCE_FORCE_BROAD_SEARCH_THRESHOLD or genus_lane is None:
+                broad_lane = self._build_broad_fallback_lane(
+                    state_filter=state_filter,
+                    min_year=min_year,
+                    max_year=max_year,
+                    min_overlap=min_overlap,
+                    max_references=max_references,
+                    exclude_species=sorted(fallback_species),
+                )
+                if broad_lane is not None:
+                    lanes.append(broad_lane)
+                    lane_summaries.append(
+                        {
+                            "name": broad_lane.name,
+                            "reference_count": len(broad_lane.entries),
+                            "fallback": True,
+                            "lane_penalty": broad_lane.lane_penalty,
+                        }
+                    )
+
+        if primary_count == 0:
+            warnings.append(
+                "No same-species references matched the requested filters. Broader fallback lanes were used."
+            )
+        elif primary_count <= SPARSE_REFERENCE_FORCE_BROAD_SEARCH_THRESHOLD:
+            warnings.append(
+                f"Same-species coverage is extremely sparse ({primary_count} references). "
+                "Broader fallback lanes were evaluated and recommendation is disabled."
+            )
+        elif sparse_coverage:
+            warnings.append(
+                f"Same-species coverage is sparse ({primary_count} references). "
+                "Fallback lanes were evaluated and recommendation is disabled."
+            )
+
+        combined_reference_count = sum(len(lane.entries) for lane in lanes)
+        diagnostics = {
+            "search_strategy": "sparse_fallback" if sparse_coverage else "species_primary",
+            "search_lanes": lane_summaries,
+            "sparse_reference_coverage": sparse_coverage,
+            "requested_species_filter": list(species_filter),
+        }
+        if state_filter:
+            diagnostics["requested_state_filter"] = list(state_filter)
+
+        return SearchPlan(
+            lanes=lanes,
+            reference_count=primary_count,
+            combined_reference_count=combined_reference_count,
+            recommendation_blocked=sparse_coverage,
+            warnings=warnings,
+            diagnostics=diagnostics,
+        )
+
+    def _build_genus_fallback_lane(
+        self,
+        *,
+        species_filter: list[str],
+        state_filter: Optional[list[str]],
+        min_year: int,
+        max_year: int,
+        min_overlap: int,
+        max_references: int,
+    ) -> Optional[SearchLane]:
+        genera = {self._species_genus_code(code) for code in species_filter if self._species_genus_code(code)}
+        if len(genera) != 1:
+            return None
+
+        genus = next(iter(genera))
+        if genus not in SUPPORTED_GENUS_FALLBACKS:
+            return None
+
+        alt_species = sorted(
+            code
+            for code in self.index.get_species()
+            if self._species_genus_code(code) == genus and code not in species_filter
+        )
+        if not alt_species:
+            return None
+
+        entries = self.index.search(
+            species=alt_species,
+            states=state_filter,
+            min_year=min_year,
+            max_year=max_year,
+            min_overlap=min_overlap,
+        )
+        fallback_states = {entry.state for entry in entries if entry.state}
+        if len(entries) < GENUS_FALLBACK_MIN_REFERENCES or len(fallback_states) < GENUS_FALLBACK_MIN_STATES:
+            return None
+
+        return SearchLane(
+            name=f"{genus.lower()}_genus_fallback",
+            entries=entries[:max_references],
+            lane_penalty=GENUS_FALLBACK_PENALTY,
+            species_filter=alt_species,
+            rationale=f"same-genus fallback ({genus}*)",
+            fallback=True,
+        )
+
+    def _build_broad_fallback_lane(
+        self,
+        *,
+        state_filter: Optional[list[str]],
+        min_year: int,
+        max_year: int,
+        min_overlap: int,
+        max_references: int,
+        exclude_species: list[str],
+    ) -> Optional[SearchLane]:
+        entries = self.index.search(
+            states=state_filter,
+            min_year=min_year,
+            max_year=max_year,
+            min_overlap=min_overlap,
+        )
+        filtered_entries = [
+            entry for entry in entries
+            if not entry.species or entry.species not in exclude_species
+        ]
+        if not filtered_entries:
+            return None
+
+        return SearchLane(
+            name="broad_fallback",
+            entries=filtered_entries[:max_references],
+            lane_penalty=BROAD_FALLBACK_PENALTY,
+            rationale="broad fallback lane",
+            fallback=True,
+        )
+
+    def _species_genus_code(self, species_code: str) -> str:
+        code = (species_code or "").upper()
+        return code[:2] if len(code) >= 2 else ""
+
     def _rank_candidates(
         self,
         *,
         sample_std: np.ndarray,
         bark_edge: bool,
-        candidates: list[ReferenceManifestEntry],
+        search_lanes: list[SearchLane],
         era_start: int,
         era_end: int,
         min_overlap: int,
@@ -365,69 +647,74 @@ class CrossdateMatcher:
     ) -> list[DatingCandidate]:
         ranked: list[DatingCandidate] = []
 
-        for entry in candidates:
-            reference = entry.master_values
-            if len(reference) < min_overlap:
-                continue
+        for lane in search_lanes:
+            for entry in lane.entries:
+                reference = entry.master_values
+                if len(reference) < min_overlap:
+                    continue
 
-            best_matches = find_best_match(
-                sample_std,
-                reference,
-                entry.master_start_year,
-                min_overlap=min_overlap,
-                n_best=1,
-            )
-            if not best_matches:
-                continue
-
-            best = best_matches[0]
-            proposed_end = best.position + len(sample_std) - 1
-            if proposed_end < era_start or proposed_end > era_end:
-                continue
-
-            offset = best.position - entry.master_start_year
-            aligned_reference = self._aligned_reference(reference, offset, len(sample_std))
-            seg_corrs = (
-                segment_correlation(
+                best_matches = find_best_match(
                     sample_std,
-                    aligned_reference,
-                    segment_length=min(50, max(20, len(sample_std) // 2)),
-                    lag=max(10, min(25, len(sample_std) // 4)),
+                    reference,
+                    entry.master_start_year,
+                    min_overlap=min_overlap,
+                    n_best=1,
                 )
-                if aligned_reference is not None
-                else []
-            )
+                if not best_matches:
+                    continue
 
-            segment_consistency = self._segment_consistency(seg_corrs)
-            composite_score = self._score_candidate(
-                result=best,
-                segment_consistency=segment_consistency,
-                entry=entry,
-                species_filter=species_filter,
-                state_filter=state_filter,
-            )
-            rationale = self._candidate_rationale(best, segment_consistency, bark_edge, entry)
+                best = best_matches[0]
+                proposed_end = best.position + len(sample_std) - 1
+                if proposed_end < era_start or proposed_end > era_end:
+                    continue
 
-            ranked.append(
-                DatingCandidate(
-                    reference_id=entry.site_id,
-                    reference_name=entry.site_name,
-                    reference_species=entry.species,
-                    reference_state=entry.state,
-                    reference_file_type=entry.file_type,
-                    proposed_start_year=int(best.position),
-                    proposed_end_year=int(proposed_end),
-                    correlation=float(best.correlation),
-                    t_value=float(best.t_value),
-                    p_value=float(best.p_value),
-                    overlap=int(best.overlap),
-                    gleichlauf=float(best.gleichlauf),
-                    segment_correlations=seg_corrs,
-                    segment_consistency=float(segment_consistency),
-                    composite_score=float(composite_score),
-                    rationale=rationale,
+                offset = best.position - entry.master_start_year
+                aligned_reference = self._aligned_reference(reference, offset, len(sample_std))
+                seg_corrs = (
+                    segment_correlation(
+                        sample_std,
+                        aligned_reference,
+                        segment_length=min(50, max(20, len(sample_std) // 2)),
+                        lag=max(10, min(25, len(sample_std) // 4)),
+                    )
+                    if aligned_reference is not None
+                    else []
                 )
-            )
+
+                segment_consistency = self._segment_consistency(seg_corrs)
+                composite_score = self._score_candidate(
+                    result=best,
+                    segment_consistency=segment_consistency,
+                    entry=entry,
+                    species_filter=species_filter,
+                    state_filter=state_filter,
+                ) - lane.lane_penalty
+                rationale = self._candidate_rationale(best, segment_consistency, bark_edge, entry)
+                if lane.rationale:
+                    rationale.append(lane.rationale)
+
+                ranked.append(
+                    DatingCandidate(
+                        reference_id=entry.site_id,
+                        reference_name=entry.site_name,
+                        reference_species=entry.species,
+                        reference_state=entry.state,
+                        reference_file_type=entry.file_type,
+                        proposed_start_year=int(best.position),
+                        proposed_end_year=int(proposed_end),
+                        correlation=float(best.correlation),
+                        t_value=float(best.t_value),
+                        p_value=float(best.p_value),
+                        overlap=int(best.overlap),
+                        gleichlauf=float(best.gleichlauf),
+                        segment_correlations=seg_corrs,
+                        segment_consistency=float(segment_consistency),
+                        composite_score=float(max(0.0, composite_score)),
+                        search_lane=lane.name,
+                        search_lane_penalty=float(lane.lane_penalty),
+                        rationale=rationale,
+                    )
+                )
 
         self._apply_year_consensus_bonus(ranked)
         ranked.sort(
@@ -443,9 +730,6 @@ class CrossdateMatcher:
         for index, candidate in enumerate(ranked):
             next_score = ranked[index + 1].composite_score if index + 1 < len(ranked) else 0.0
             candidate.score_gap_to_next = float(candidate.composite_score - next_score)
-
-        if ranked:
-            ranked[0].is_recommended = self._is_recommended(ranked[0])
 
         return ranked[:top_n]
 
@@ -587,7 +871,9 @@ class CrossdateMatcher:
 
         return rationale
 
-    def _is_recommended(self, candidate: DatingCandidate) -> bool:
+    def _is_recommended(self, candidate: DatingCandidate, *, recommendation_blocked: bool = False) -> bool:
+        if recommendation_blocked:
+            return False
         return bool(
             candidate.composite_score >= 0.62
             and candidate.correlation >= 0.4
