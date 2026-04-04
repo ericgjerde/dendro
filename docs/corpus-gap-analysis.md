@@ -25,24 +25,26 @@ python scripts/validate_crossdating.py \
 
 ## Overall Results
 
-- Top-1 within +/- 2 years: 427 / 1,121 (38.1%)
-- Top-5 contains the correct year: 577 / 1,121 (51.5%)
-- Correct and `recommended`: 123 / 1,121 (11.0%)
-- Correct but only `ranked`: 304 / 1,121 (27.1%)
-- `ranking_miss`: 237 / 1,121 (21.1%)
-- `long_offset_false_positive`: 298 / 1,121 (26.6%)
-- `search_miss`: 101 / 1,121 (9.0%)
+- Top-1 within +/- 2 years: 573 / 1,121 (51.1%)
+- Top-5 contains the correct year: 649 / 1,121 (57.9%)
+- Correct and `recommended`: 125 / 1,121 (11.2%)
+- Correct but only `ranked`: 448 / 1,121 (40.0%)
+- `ranking_miss`: 141 / 1,121 (12.6%)
+- `long_offset_false_positive`: 233 / 1,121 (20.8%)
+- `search_miss`: 112 / 1,121 (10.0%)
 - `no_match`: 54 / 1,121 (4.8%)
 
 The dominant failure mode is not total absence of candidates. The system usually
 finds something, but it often promotes the wrong era to the top of the ranking.
+The first year-consensus ranking pass materially improved top-1 recovery, but
+ranking mistakes still dominate the remaining error budget.
 
 ## Main Failure Areas
 
-### 1. Long-offset false positives dominate the common-species corpus
+### 1. Long-offset false positives still dominate the remaining common-species failures
 
-- `long_offset_false_positive`: 298 cases
-- `ranking_miss`: 237 cases
+- `long_offset_false_positive`: 233 cases
+- `ranking_miss`: 141 cases
 - Wrong top-1 alignments skew strongly earlier than the truth:
   - earlier: 555
   - later: 81
@@ -50,8 +52,8 @@ finds something, but it often promotes the wrong era to the top of the ranking.
 
 This is most visible in the large eastern hemlock and red spruce networks:
 
-- `TSCA`: 423 cases total, 47.8% top-1 pass, 27.9% ranking miss, 18.7% long-offset false positive
-- `PCRU`: 385 cases total, 48.3% top-1 pass, 26.0% ranking miss, 20.8% long-offset false positive
+- `TSCA`: 423 cases total, 71.6% top-1 pass, 13.0% ranking miss, 10.2% long-offset false positive
+- `PCRU`: 385 cases total, 59.7% top-1 pass, 17.7% ranking miss, 16.4% long-offset false positive
 
 Observed pattern:
 
@@ -69,9 +71,9 @@ Evidence that this is primarily a ranking problem:
 
 Likely cause:
 
-- the composite score is still too willing to reward local correlation peaks that
-  occur far earlier in the chronology,
-- long-offset aliases are not penalized enough,
+- the composite score is still too willing to reward some local correlation
+  peaks that occur far earlier in the chronology,
+- long-offset aliases are penalized more than before, but still not enough,
 - species-only filtering still leaves a large enough search space that strong
   analog chronologies can outrank the right year.
 
@@ -101,12 +103,12 @@ Likely cause:
 
 Top-1 pass rate by state:
 
-- `CT`: 84.9%
-- `VT`: 73.8%
-- `NH`: 52.2%
-- `ME`: 37.1%
-- `NY`: 26.8%
-- `MA`: 17.5%
+- `CT`: 98.1%
+- `VT`: 80.0%
+- `NH`: 67.4%
+- `ME`: 45.9%
+- `NY`: 41.8%
+- `MA`: 41.3%
 
 This is not just geography. The weak states are loaded with harder domains:
 
@@ -125,15 +127,15 @@ Likely cause:
 Length-bucket top-1 pass rate:
 
 - 50-99 rings: 4.0%
-- 100-149 rings: 18.4%
-- 150-249 rings: 39.8%
-- 250+ rings: 39.5%
+- 100-149 rings: 23.7%
+- 150-249 rings: 50.0%
+- 250+ rings: 55.8%
 
 This means length matters, but it is not the main blocker after about 150 rings.
 Long series still fail because of wrong-era promotion:
 
-- `250+` bucket long-offset false positives: 169 cases
-- `250+` bucket ranking misses: 144 cases
+- `250+` bucket long-offset false positives: 129 cases
+- `250+` bucket ranking misses: 83 cases
 
 Likely cause:
 
@@ -143,7 +145,7 @@ Likely cause:
 ### 5. Recommendation policy is conservative relative to actual recovery
 
 - curated suite: 5 / 5 correct, 0 / 5 `recommended`
-- full sweep: 427 correct top-1, but only 123 `recommended`
+- full sweep: 573 correct top-1, but only 125 `recommended`
 
 This is partly intentional, but it still creates a product tension:
 
@@ -219,3 +221,14 @@ The analysis suggests four concrete follow-up tracks:
 2. coverage/fallback work for sparse species
 3. domain-specific benchmark slices and acceptance targets
 4. recommendation calibration after the ranking changes land
+
+## Benchmark Slice Seed
+
+The initial slice taxonomy and target metrics have been seeded in
+`tests/fixtures/benchmark_slices_v1.json`. This file is intentionally
+metadata-only for now so the next implementation pass can map every benchmark
+case into:
+
+- one primary slice,
+- zero or more overlays,
+- slice-specific acceptance targets.

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Optional
 
 import numpy as np
@@ -17,6 +18,7 @@ from ..reference.chronology_index import ChronologyIndex, ReferenceManifestEntry
 
 
 POLICY_VERSION = "2026.04-assisted-ranking-v1"
+YEAR_CONSENSUS_WINDOW = 2
 
 
 @dataclass
@@ -39,6 +41,9 @@ class DatingCandidate:
     segment_consistency: float = 0.0
     composite_score: float = 0.0
     score_gap_to_next: float = 0.0
+    year_cluster_support: int = 1
+    year_cluster_unique_families: int = 1
+    year_cluster_bonus: float = 0.0
     is_recommended: bool = False
     rationale: list[str] = field(default_factory=list)
 
@@ -77,6 +82,9 @@ class DatingCandidate:
             "segment_consistency": float(round(self.segment_consistency, 4)),
             "composite_score": float(round(self.composite_score, 4)),
             "score_gap_to_next": float(round(self.score_gap_to_next, 4)),
+            "year_cluster_support": int(self.year_cluster_support),
+            "year_cluster_unique_families": int(self.year_cluster_unique_families),
+            "year_cluster_bonus": float(round(self.year_cluster_bonus, 4)),
             "is_recommended": bool(self.is_recommended),
             "rationale": list(self.rationale),
             "segment_correlations": [
@@ -421,7 +429,17 @@ class CrossdateMatcher:
                 )
             )
 
-        ranked.sort(key=lambda candidate: (candidate.composite_score, candidate.t_value, candidate.correlation), reverse=True)
+        self._apply_year_consensus_bonus(ranked)
+        ranked.sort(
+            key=lambda candidate: (
+                candidate.composite_score,
+                candidate.year_cluster_bonus,
+                candidate.year_cluster_support,
+                candidate.t_value,
+                candidate.correlation,
+            ),
+            reverse=True,
+        )
         for index, candidate in enumerate(ranked):
             next_score = ranked[index + 1].composite_score if index + 1 < len(ranked) else 0.0
             candidate.score_gap_to_next = float(candidate.composite_score - next_score)
@@ -430,6 +448,55 @@ class CrossdateMatcher:
             ranked[0].is_recommended = self._is_recommended(ranked[0])
 
         return ranked[:top_n]
+
+    def _apply_year_consensus_bonus(self, ranked: list[DatingCandidate]):
+        if not ranked:
+            return
+
+        family_cache = {
+            candidate.reference_id: self._normalize_reference_family(candidate.reference_name)
+            for candidate in ranked
+        }
+
+        for candidate in ranked:
+            cluster = [
+                other
+                for other in ranked
+                if abs(other.outer_ring_year - candidate.outer_ring_year) <= YEAR_CONSENSUS_WINDOW
+            ]
+            support = len(cluster)
+            unique_families = len({family_cache[other.reference_id] for other in cluster})
+            raw_score = candidate.composite_score
+            bonus = min(0.18, max(0.0, 0.03 * (support - 1) + 0.025 * (unique_families - 1)))
+            if support == 1:
+                bonus -= 0.03
+
+            candidate.year_cluster_support = support
+            candidate.year_cluster_unique_families = unique_families
+            candidate.year_cluster_bonus = bonus
+            candidate.composite_score = raw_score + bonus
+
+            if unique_families >= 3:
+                candidate.rationale.append("multi-family year consensus")
+            elif support >= 2:
+                candidate.rationale.append("limited year consensus")
+            else:
+                candidate.rationale.append("isolated-year candidate")
+            if support >= 2:
+                candidate.rationale.append(f"year-consensus={support}")
+
+    def _apply_year_consensus(self, candidates: list[DatingCandidate]):
+        # Backwards-compatible helper retained for older tests and callers.
+        self._apply_year_consensus_bonus(candidates)
+
+    def _normalize_reference_family(self, reference_name: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", " ", reference_name.lower()).strip()
+        tokens = [
+            token
+            for token in normalized.split()
+            if token not in {"update", "historical", "recollection", "core", "cores", "long", "new"}
+        ]
+        return " ".join(tokens) or normalized
 
     def _aligned_reference(
         self,
@@ -527,6 +594,7 @@ class CrossdateMatcher:
             and candidate.t_value >= 5.5
             and candidate.overlap >= 50
             and candidate.segment_consistency >= 0.5
+            and candidate.year_cluster_support >= 2
             and candidate.score_gap_to_next >= 0.04
         )
 

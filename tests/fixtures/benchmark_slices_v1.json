@@ -1,0 +1,110 @@
+{
+  "name": "benchmark_slices_v1",
+  "description": "Primary benchmark slices and overlays derived from the 2026-04-04 expanded corpus sweep.",
+  "primary_slices": [
+    {
+      "id": "core_dense_conifer",
+      "description": "High-confidence dense conifer domain suitable for the public GA support boundary.",
+      "inclusion": {
+        "species_state_allowlist": [
+          ["TSCA", "CT"],
+          ["TSCA", "VT"],
+          ["PCRU", "VT"],
+          ["PCRU", "NH"]
+        ],
+        "min_length": 150
+      },
+      "targets": {
+        "top1_within_2_years_rate": 0.8,
+        "top5_within_2_years_rate": 0.95,
+        "long_offset_false_positive_rate": 0.05,
+        "no_match_rate": 0.0,
+        "recommended_precision": 0.98
+      }
+    },
+    {
+      "id": "frontier_dense_conifer",
+      "description": "Dense TSCA and PCRU domains outside the narrow GA claim boundary.",
+      "inclusion": {
+        "species_any_of": ["TSCA", "PCRU"],
+        "exclude_slice_ids": ["core_dense_conifer"],
+        "min_length": 150
+      },
+      "targets": {
+        "top1_within_2_years_rate": 0.65,
+        "top5_within_2_years_rate": 0.85,
+        "long_offset_false_positive_rate": 0.1,
+        "no_match_rate": 0.01,
+        "recommended_precision": 0.98
+      }
+    },
+    {
+      "id": "mid_density_conifer",
+      "description": "Conifer species with moderate coverage and mixed ranking quality.",
+      "inclusion": {
+        "species_any_of": ["PIST", "PIRI", "FRNI", "ABBA", "CHTH"],
+        "min_length": 150
+      },
+      "targets": {
+        "top1_within_2_years_rate": 0.55,
+        "top5_within_2_years_rate": 0.8,
+        "long_offset_false_positive_rate": 0.12,
+        "no_match_rate": 0.05,
+        "recommended_precision": 0.99
+      }
+    },
+    {
+      "id": "hardwood_legacy",
+      "description": "Hardwood and historical-building material that currently behaves as an experimental domain.",
+      "inclusion": {
+        "species_any_of": ["QUAL", "QUPR", "QURU", "QUSP", "QUVE", "CYGL", "FRAM"],
+        "min_length": 150
+      },
+      "targets": {
+        "top1_within_2_years_rate": 0.5,
+        "top5_within_2_years_rate": 0.75,
+        "long_offset_false_positive_rate": 0.15,
+        "no_match_rate": 0.05,
+        "recommended_precision": 0.99
+      }
+    },
+    {
+      "id": "sparse_coverage_fallback",
+      "description": "Thin-coverage cases where the benchmark should expect explicit sparse-search behavior and extremely conservative recommendations.",
+      "inclusion": {
+        "max_reference_count_after_exclusion": 4,
+        "species_any_of": ["JUVI", "THOC", "PIPA", "PIRE", "QUST", "BELE", "CYOV", "LITU", "ACSA", "ACSH"]
+      },
+      "targets": {
+        "top1_within_2_years_rate": 0.35,
+        "top5_within_2_years_rate": 0.6,
+        "no_match_rate": 0.15,
+        "recommended_precision": 1.0,
+        "recommended_rate_max": 0.05
+      }
+    }
+  ],
+  "overlays": [
+    {
+      "id": "short_series",
+      "description": "Track short samples across every primary slice.",
+      "inclusion": {
+        "max_length": 149
+      }
+    },
+    {
+      "id": "thin_search_space",
+      "description": "Track cases where the filtered reference pool is too small to justify recommendation behavior.",
+      "inclusion": {
+        "max_reference_count_after_exclusion": 9
+      }
+    }
+  ],
+  "taxonomy_order": [
+    "sparse_coverage_fallback",
+    "core_dense_conifer",
+    "frontier_dense_conifer",
+    "mid_density_conifer",
+    "hardwood_legacy"
+  ]
+}
