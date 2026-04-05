@@ -187,6 +187,52 @@ The session file stores:
 - exported `oldest_to_newest` widths,
 - QC warnings.
 
+## Local Known-Date Scan Intake
+
+The repo now includes a scaffolded workflow for the missing real-world validation corpus.
+
+Create a local suite for known-date scans:
+
+```bash
+dendro init-validation-suite data/local_validation/walpole_firewood \
+  --name "Walpole firewood known-date scans" \
+  --town Walpole \
+  --state NH \
+  --built-year-range 1760:1800
+```
+
+Add a supported case:
+
+```bash
+dendro add-validation-case data/local_validation/walpole_firewood hemlock_round_2026_001 \
+  --species-name "Eastern Hemlock" \
+  --species-code TSCA \
+  --material-group hemlock \
+  --true-outer-ring-year 2026 \
+  --sample-origin firewood \
+  --scan-dpi 1200
+```
+
+Add an unsupported-policy case:
+
+```bash
+dendro add-validation-case data/local_validation/walpole_firewood ash_round_2026_001 \
+  --species-name "White Ash" \
+  --species-code FRAM \
+  --expected-policy-outcome unsupported_inconclusive \
+  --true-outer-ring-year 2026 \
+  --sample-origin firewood \
+  --scale-included
+```
+
+Check readiness:
+
+```bash
+dendro validation-info data/local_validation/walpole_firewood
+```
+
+See [docs/local-scan-validation.md](/Users/egjerde/code/dendrochronology/docs/local-scan-validation.md) for the full intake workflow.
+
 ## JSON Report Schema
 
 `dendro date --json` emits:

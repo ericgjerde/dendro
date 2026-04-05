@@ -25,11 +25,21 @@ from ..reference.tucson_parser import (
     parse_crn_file,
     parse_rwl_file,
 )
+from ..validation.intake import (
+    DEFAULT_LOCAL_VALIDATION_BUILT_YEAR_RANGE,
+    EXPECTED_POLICY_OUTCOMES,
+    SAMPLE_ORIGINS,
+    add_local_validation_case,
+    init_local_validation_suite,
+    summarize_local_validation_suite,
+)
 
 
 DEFAULT_DATA_DIR = Path.cwd() / "data"
 ORIENTATION_CHOICES = click.Choice(["auto", "oldest_to_newest", "bark_to_pith"], case_sensitive=False)
 MEASUREMENT_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+EXPECTED_POLICY_OUTCOME_CHOICES = click.Choice(list(EXPECTED_POLICY_OUTCOMES), case_sensitive=False)
+SAMPLE_ORIGIN_CHOICES = click.Choice(list(SAMPLE_ORIGINS), case_sensitive=False)
 
 
 @click.group()
@@ -391,6 +401,167 @@ def infer_materials(
         return
 
     _print_material_inference(report)
+
+
+@cli.command("init-validation-suite")
+@click.argument("suite_dir", type=click.Path())
+@click.option("--suite-id", default=None, help="Stable suite identifier.")
+@click.option("--name", default=None, help="Human-readable suite name.")
+@click.option("--scope", default="walpole_nh_late_1700s_house", help="Context scope id.")
+@click.option("--town", default="Walpole", help="Default town for new cases.")
+@click.option("--state", "context_state", default="NH", help="Default state for new cases.")
+@click.option("--built-year-range", default="1760:1800", help="Default built-year range as START:END.")
+@click.option("--force/--no-force", default=False, help="Overwrite the suite manifest if it already exists.")
+def init_validation_suite(
+    suite_dir: str,
+    suite_id: Optional[str],
+    name: Optional[str],
+    scope: str,
+    town: str,
+    context_state: str,
+    built_year_range: str,
+    force: bool,
+):
+    """Create a local known-date scan validation suite scaffold."""
+    built_year_range_value = _parse_built_year_range_or_exit(built_year_range) or DEFAULT_LOCAL_VALIDATION_BUILT_YEAR_RANGE
+    try:
+        suite_file = init_local_validation_suite(
+            suite_dir,
+            suite_id=suite_id,
+            name=name,
+            scope=scope,
+            town=town,
+            state=context_state,
+            built_year_range=built_year_range_value,
+            force=force,
+        )
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Created validation suite at {suite_file}")
+    click.echo(f"Add cases with: dendro add-validation-case {Path(suite_dir)} <case-id> ...")
+
+
+@cli.command("add-validation-case")
+@click.argument("suite_dir", type=click.Path(exists=True))
+@click.argument("case_id")
+@click.option("--label", default=None, help="Human-readable case label.")
+@click.option("--species-name", required=True, help="Trusted species or wood name.")
+@click.option("--species-code", default=None, help="Optional species code such as TSCA.")
+@click.option("--material-group", default=None, help="Known supported material group when applicable.")
+@click.option("--expected-policy-outcome", type=EXPECTED_POLICY_OUTCOME_CHOICES, default="supported_dateable", help="Expected policy behavior for this case.")
+@click.option("--sample-origin", type=SAMPLE_ORIGIN_CHOICES, default="firewood", help="Where the sample came from.")
+@click.option("--member-type", default="unknown", help="House-member type or unknown.")
+@click.option("--true-outer-ring-year", type=int, required=True, help="Trusted outer-ring year for the sample.")
+@click.option("--cut-date", default=None, help="Optional full cut date for provenance.")
+@click.option("--town", default=None, help="Override town for this case.")
+@click.option("--state", "context_state", default=None, help="Override state for this case.")
+@click.option("--built-year-range", default=None, help="Override built-year range as START:END.")
+@click.option("--bark-edge/--no-bark-edge", default=True, help="Whether the scanned sample includes the bark edge.")
+@click.option("--scan-dpi", type=int, default=None, help="Known scan DPI if already planned.")
+@click.option("--scale-included/--no-scale-included", default=False, help="Scale or ruler will appear in the scan.")
+@click.option("--note", "notes", multiple=True, help="Additional case note. Repeat to add more.")
+@click.option("--force/--no-force", default=False, help="Overwrite an existing case scaffold.")
+def add_validation_case(
+    suite_dir: str,
+    case_id: str,
+    label: Optional[str],
+    species_name: str,
+    species_code: Optional[str],
+    material_group: Optional[str],
+    expected_policy_outcome: str,
+    sample_origin: str,
+    member_type: str,
+    true_outer_ring_year: int,
+    cut_date: Optional[str],
+    town: Optional[str],
+    context_state: Optional[str],
+    built_year_range: Optional[str],
+    bark_edge: bool,
+    scan_dpi: Optional[int],
+    scale_included: bool,
+    notes: tuple[str, ...],
+    force: bool,
+):
+    """Add a local known-date scan case scaffold."""
+    built_year_range_value = _parse_built_year_range_or_exit(built_year_range) if built_year_range else None
+    try:
+        case_file = add_local_validation_case(
+            suite_dir,
+            case_id=case_id,
+            label=label,
+            sample_origin=sample_origin,
+            expected_policy_outcome=expected_policy_outcome,
+            known_species_name=species_name,
+            known_species_code=species_code,
+            known_material_group=material_group,
+            member_type=member_type,
+            true_outer_ring_year=true_outer_ring_year,
+            cut_date=cut_date,
+            town=town,
+            state=context_state,
+            built_year_range=built_year_range_value,
+            has_bark_edge=bark_edge,
+            scan_dpi=scan_dpi,
+            scale_included=scale_included,
+            notes=tuple(notes),
+            force=force,
+        )
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Created validation case at {case_file}")
+    click.echo(f"Drop artifacts under {Path(case_file).parent / 'artifacts'}")
+
+
+@cli.command("validation-info")
+@click.argument("suite_path", type=click.Path(exists=True))
+@click.option("--json", "json_output", is_flag=True, default=False, help="Print suite readiness as JSON.")
+def validation_info(suite_path: str, json_output: bool):
+    """Summarize local known-date scan validation readiness."""
+    try:
+        payload = summarize_local_validation_suite(suite_path)
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    if json_output:
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    suite = payload["suite"]
+    summary = payload["summary"]
+    click.echo(f"Validation suite: {suite['name']}")
+    click.echo(f"Root: {Path(suite_path).resolve()}")
+    click.echo(f"Scope: {suite['scope']}")
+    click.echo(f"Cases: {summary['case_count']}")
+    click.echo("Expected policy outcomes:")
+    for key, count in summary["expected_policy_outcomes"].items():
+        click.echo(f"  {key}: {count}")
+    click.echo("Readiness:")
+    for key in (
+        "metadata_ready",
+        "measurement_track_ready",
+        "scan_session_track_ready",
+        "ready_for_full_validation",
+        "ready_for_measurement_validation",
+        "awaiting_artifacts",
+        "metadata_incomplete",
+    ):
+        click.echo(f"  {key}: {summary['readiness'].get(key, 0)}")
+    click.echo("Cases:")
+    for case in payload["cases"]:
+        missing = ", ".join(case["missing_artifacts"]) if case["missing_artifacts"] else "none"
+        click.echo(
+            f"  {case['case_id']}: {case['status']} "
+            f"[species={case['known_species_name']}; material={case['known_material_group'] or 'none'}; missing={missing}]"
+        )
+        if case["missing_metadata"]:
+            click.echo("    missing metadata: " + ", ".join(case["missing_metadata"]))
+        if case["warnings"]:
+            click.echo("    warnings: " + " | ".join(case["warnings"]))
 
 
 @cli.command()
