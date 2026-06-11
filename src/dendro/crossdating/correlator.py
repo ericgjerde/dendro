@@ -155,25 +155,41 @@ def calculate_gleichlauf(series1: np.ndarray, series2: np.ndarray) -> float:
     if len(series1) != len(series2) or len(series1) < 2:
         return 0.0
 
-    # Calculate year-to-year changes
-    diff1 = np.diff(series1)
-    diff2 = np.diff(series2)
+    # Year-to-year interval signs (Eckstein & Bauch 1969).
+    sign1 = np.sign(np.diff(series1))
+    sign2 = np.sign(np.diff(series2))
 
-    # Count agreements
-    # Sign: positive = +1, zero = 0, negative = -1
-    sign1 = np.sign(diff1)
-    sign2 = np.sign(diff2)
+    n = len(sign1)
 
-    n = len(diff1)
-    agreements = np.sum(sign1 == sign2)
+    # Full agreement when both intervals share a sign (including both flat);
+    # half credit when exactly one interval is flat; no credit on opposite signs.
+    same = sign1 == sign2
+    one_zero = (~same) & ((sign1 == 0) | (sign2 == 0))
+    score = np.sum(same) + 0.5 * np.sum(one_zero)
 
-    # Count cases where one or both are zero (half weight)
-    zeros = np.sum((sign1 == 0) | (sign2 == 0))
+    return 100.0 * score / n
 
-    # Adjusted GLK
-    glk = 100 * (agreements - zeros * 0.5 + zeros * 0.5) / n
 
-    return glk
+def gleichlauf_significance(glk_percent: float, n: int) -> float:
+    """
+    Approximate two-sided significance (p-value) of a Gleichläufigkeit value.
+
+    Under the null hypothesis of independent series, GLK is ~50% with standard
+    error ``1 / (2 * sqrt(n-1))`` (Eckstein & Bauch 1969). This returns the
+    probability of observing a deviation from 50% at least this large by chance.
+
+    Args:
+        glk_percent: Gleichläufigkeit as a percentage (0-100).
+        n: Number of overlapping years (intervals used = n - 1).
+
+    Returns:
+        Two-sided p-value (lower = more significant).
+    """
+    if n < 3:
+        return 1.0
+    se = 1.0 / (2.0 * np.sqrt(n - 1))
+    z = abs(glk_percent / 100.0 - 0.5) / se
+    return float(2.0 * (1.0 - stats.norm.cdf(z)))
 
 
 def cross_correlation(
@@ -295,6 +311,88 @@ def find_best_match(
     return results[:n_best]
 
 
+@dataclass
+class MissingRingHint:
+    """A heuristic suggestion that a sample has a missing or false ring."""
+
+    index: int  # sample index where the discontinuity is suggested
+    kind: str  # "missing" (sample omits a ring) or "false" (sample has an extra)
+    baseline_correlation: float
+    improved_correlation: float
+
+    @property
+    def gain(self) -> float:
+        return self.improved_correlation - self.baseline_correlation
+
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) < 3 or len(b) < 3 or len(a) != len(b):
+        return 0.0
+    if np.std(a) == 0 or np.std(b) == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def detect_missing_ring(
+    sample: np.ndarray,
+    reference: np.ndarray,
+    min_segment: int = 15,
+    min_gain: float = 0.1,
+) -> Optional[MissingRingHint]:
+    """
+    Heuristically locate a single missing or false ring causing a dating misfit.
+
+    A locally absent ring (a year with no measurable growth) or a false/double
+    ring shifts every later ring by one, so a sample can correlate only weakly
+    even at its true position. This scans candidate break points: at each one it
+    tests whether re-aligning the later part of the sample by +/-1 ring against
+    the reference substantially improves correlation over the rigid alignment.
+
+    The reference must be at least one ring longer than the sample and aligned so
+    that ``sample[0]`` corresponds to ``reference[0]``.
+
+    Args:
+        sample: Standardized sample series (oldest -> newest).
+        reference: Standardized reference series aligned to the sample start;
+            should extend at least ``len(sample) + 1``.
+        min_segment: Minimum rings on each side of a candidate break.
+        min_gain: Minimum correlation improvement to report a hint.
+
+    Returns:
+        A ``MissingRingHint`` for the best-supported location, or ``None``.
+    """
+    sample = np.asarray(sample, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    n = len(sample)
+    if n < 2 * min_segment + 1 or len(reference) < n + 1:
+        return None
+
+    baseline = _safe_corr(sample, reference[:n])
+    best: Optional[MissingRingHint] = None
+
+    for k in range(min_segment, n - min_segment):
+        head = _safe_corr(sample[:k], reference[:k])
+
+        # "missing": sample omits a ring at k, so its tail lines up one ring
+        # later in the reference.
+        tail_missing = _safe_corr(sample[k:], reference[k + 1 : k + 1 + (n - k)])
+        # "false": sample has an extra ring at k, so its tail lines up one ring
+        # earlier in the reference.
+        tail_false = _safe_corr(sample[k:], reference[k - 1 : k - 1 + (n - k)])
+
+        for kind, tail in (("missing", tail_missing), ("false", tail_false)):
+            combined = 0.5 * (head + tail)
+            if combined - baseline >= min_gain and (best is None or combined > best.improved_correlation):
+                best = MissingRingHint(
+                    index=k,
+                    kind=kind,
+                    baseline_correlation=baseline,
+                    improved_correlation=combined,
+                )
+
+    return best
+
+
 def dating_confidence(result: CorrelationResult) -> str:
     """
     Assess confidence level of a dating result.
@@ -307,12 +405,22 @@ def dating_confidence(result: CorrelationResult) -> str:
     Returns:
         Confidence level: "HIGH", "MEDIUM", or "LOW".
     """
-    # High confidence: strong correlation and good overlap
-    if result.t_value >= 6.0 and result.correlation >= 0.55 and result.overlap >= 50:
+    # High confidence: strong correlation, good overlap, and parallel variation.
+    if (
+        result.t_value >= 6.0
+        and result.correlation >= 0.55
+        and result.overlap >= 50
+        and result.gleichlauf >= 62.0
+    ):
         return "HIGH"
 
-    # Medium confidence: decent statistics
-    if result.t_value >= 4.0 and result.correlation >= 0.45 and result.overlap >= 30:
+    # Medium confidence: decent statistics.
+    if (
+        result.t_value >= 4.0
+        and result.correlation >= 0.45
+        and result.overlap >= 30
+        and result.gleichlauf >= 58.0
+    ):
         return "MEDIUM"
 
     # Low confidence

@@ -1,16 +1,15 @@
 """Tests for Tucson format parser."""
 
-import numpy as np
-import pytest
-from io import StringIO
-from pathlib import Path
 import tempfile
+from pathlib import Path
+
+import numpy as np
 
 from dendro.reference.tucson_parser import (
-    parse_rwl_file,
-    _parse_rwl_line,
     RingWidthSeries,
     RWLFile,
+    _parse_rwl_line,
+    parse_rwl_file,
 )
 
 

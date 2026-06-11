@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from .tucson_parser import parse_rwl_file, parse_crn_file, Chronology, RWLFile
+from .tucson_parser import Chronology, RWLFile, parse_crn_file, parse_rwl_file
 
 
 @dataclass

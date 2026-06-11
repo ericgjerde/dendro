@@ -1,7 +1,7 @@
 """Image processing for ring width extraction from scanned samples."""
 
-from .ring_detector import detect_rings
 from .path_sampler import sample_along_path
+from .ring_detector import detect_rings
 from .viewer import MeasurementViewer
 
 __all__ = [

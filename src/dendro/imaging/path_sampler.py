@@ -256,8 +256,9 @@ def widths_to_tucson(
     Returns:
         Tucson format string.
     """
-    # Convert mm to 0.01mm units (standard Tucson)
-    widths_001mm = (widths_mm * 100).astype(int)
+    # Convert mm to 0.01mm units (standard Tucson). Round rather than truncate
+    # so a 1.27 mm ring becomes 127, not 126.
+    widths_001mm = np.rint(np.asarray(widths_mm, dtype=np.float64) * 100).astype(int)
 
     # Reverse if needed (Tucson goes from oldest to newest)
     # Our widths are bark-to-pith (newest to oldest), so reverse
@@ -276,10 +277,7 @@ def widths_to_tucson(
     idx = 0
 
     while idx < len(widths_001mm):
-        # Start of decade
-        decade_start = (year // 10) * 10
-
-        # How many values fit in this decade
+        # How many values fit in the current decade row
         values_in_decade = min(10 - (year % 10), len(widths_001mm) - idx)
 
         # Build line

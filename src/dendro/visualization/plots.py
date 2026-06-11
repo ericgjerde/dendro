@@ -8,13 +8,12 @@ in results through multiple lines of evidence.
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import numpy as np
 
-from ..crossdating.matcher import CrossdateReport, MatchResult
-from ..crossdating.correlator import sliding_correlation, CorrelationResult
-
+from ..crossdating.correlator import CorrelationResult
+from ..crossdating.matcher import CrossdateReport
 
 # Known marker years for New England region
 MARKER_YEARS = {
@@ -206,7 +205,7 @@ def plot_segment_analysis(
 
     # Plot as bars
     width = (years[1] - years[0]) * 0.8 if len(years) > 1 else 20
-    bars = ax.bar(years, correlations, width=width, color=colors, alpha=0.7, edgecolor='black')
+    ax.bar(years, correlations, width=width, color=colors, alpha=0.7, edgecolor='black')
 
     # Add threshold lines
     ax.axhline(0.55, color='green', linestyle='--', alpha=0.7, label='HIGH (r=0.55)')

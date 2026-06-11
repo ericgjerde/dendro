@@ -12,14 +12,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Callable, Optional
 
 import numpy as np
 
 try:
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import Button, Slider
-    from matplotlib.backend_bases import MouseEvent, KeyEvent
+    from matplotlib.backend_bases import KeyEvent, MouseEvent  # noqa: F401
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
@@ -360,7 +359,7 @@ class MeasurementViewer:
         self.session.ring_widths_mm = widths
         self.session.is_finalized = True
 
-        print(f"\nMeasurement complete!")
+        print("\nMeasurement complete!")
         print(f"Number of rings: {len(widths)}")
         print(f"Total span: {boundaries_mm[-1] - boundaries_mm[0]:.1f} mm")
         print(f"Mean ring width: {np.mean(widths):.2f} mm")

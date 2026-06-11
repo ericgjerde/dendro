@@ -20,15 +20,42 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .correlator import (
-    CorrelationResult,
-    find_best_match,
-    segment_correlation,
-    dating_confidence,
-)
-from .detrend import detrend_series, standardize, DetrendMethod
 from ..reference.chronology_index import ChronologyIndex, ChronologyMetadata
-from ..reference.tucson_parser import parse_rwl_file, parse_crn_file, Chronology, RWLFile
+from ..reference.tucson_parser import Chronology, RWLFile
+from .correlator import (
+    dating_confidence,
+    find_best_match,
+    gleichlauf_significance,
+    segment_correlation,
+)
+from .detrend import DetrendMethod, build_chronology, detrend_series, standardize
+from .felling import FellingEstimate, estimate_felling
+
+
+def normalize_orientation(values: np.ndarray, orientation: str) -> np.ndarray:
+    """
+    Return a ring-width series in canonical order (oldest -> newest / pith -> bark).
+
+    All cross-dating in this package assumes the sample runs oldest ring first,
+    matching how ITRDB reference chronologies are stored. A sample measured from
+    the bark inward must be reversed before dating.
+
+    Args:
+        values: Ring-width series.
+        orientation: ``"pith_to_bark"`` (already canonical) or ``"bark_to_pith"``
+            (will be reversed).
+
+    Returns:
+        The series in oldest-to-newest order.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if orientation == "pith_to_bark":
+        return values
+    if orientation == "bark_to_pith":
+        return values[::-1].copy()
+    raise ValueError(
+        f"Unknown orientation {orientation!r}; expected 'pith_to_bark' or 'bark_to_pith'."
+    )
 
 
 @dataclass
@@ -46,11 +73,22 @@ class MatchResult:
     overlap: int
     gleichlauf: float
     confidence: str
+    glk_p_value: float = 1.0
     segment_correlations: list[tuple[int, float, float]] = field(default_factory=list)
 
     @property
+    def last_ring_year(self) -> int:
+        """Calendar year of the outermost (last measured) ring."""
+        return self.proposed_end_year
+
+    @property
     def felling_year(self) -> int:
-        """The proposed felling year (last ring + bark edge)."""
+        """
+        Backwards-compatible alias for the last-ring year.
+
+        Note: this is only the felling year when a bark edge is present. Use the
+        report's ``felling_estimate`` for the correct interpretation otherwise.
+        """
         return self.proposed_end_year
 
 
@@ -65,27 +103,32 @@ class CrossdateReport:
     matches: list[MatchResult]
     consensus_year: Optional[int] = None
     consensus_confidence: str = "LOW"
+    felling_estimate: Optional[FellingEstimate] = None
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        """Convert report to dictionary for serialization."""
+        """Convert report to a JSON-serializable dictionary (native types only)."""
         return {
             "sample_name": self.sample_name,
-            "sample_length": self.sample_length,
-            "has_bark_edge": self.has_bark_edge,
+            "sample_length": int(self.sample_length),
+            "has_bark_edge": bool(self.has_bark_edge),
             "detrend_method": self.detrend_method,
-            "consensus_year": self.consensus_year,
+            "consensus_year": int(self.consensus_year) if self.consensus_year is not None else None,
             "consensus_confidence": self.consensus_confidence,
-            "warnings": self.warnings,
+            "felling_estimate": self.felling_estimate.to_dict() if self.felling_estimate else None,
+            "warnings": list(self.warnings),
             "matches": [
                 {
                     "reference": m.reference_name,
                     "species": m.reference_species,
                     "state": m.reference_state,
-                    "felling_year": m.felling_year,
-                    "correlation": round(m.correlation, 4),
-                    "t_value": round(m.t_value, 2),
-                    "overlap": m.overlap,
+                    "last_ring_year": int(m.last_ring_year),
+                    "felling_year": int(m.felling_year),
+                    "correlation": round(float(m.correlation), 4),
+                    "t_value": round(float(m.t_value), 2),
+                    "gleichlauf": round(float(m.gleichlauf), 1),
+                    "glk_p_value": float(m.glk_p_value),
+                    "overlap": int(m.overlap),
                     "confidence": m.confidence,
                 }
                 for m in self.matches
@@ -117,6 +160,10 @@ class CrossdateMatcher:
         else:
             self.index = ChronologyIndex()
 
+        # Cache of standardized master chronologies keyed by reference filepath,
+        # so each reference is parsed and detrended at most once per matcher.
+        self._master_cache: dict[str, Optional[tuple[np.ndarray, int]]] = {}
+
     def date_sample(
         self,
         values: np.ndarray,
@@ -129,12 +176,17 @@ class CrossdateMatcher:
         detrend_method: DetrendMethod = DetrendMethod.SPLINE,
         min_overlap: int = 30,
         max_references: int = 20,
+        orientation: str = "pith_to_bark",
+        has_sapwood: bool = False,
+        sapwood_count: Optional[int] = None,
     ) -> CrossdateReport:
         """
         Cross-date a sample against available reference chronologies.
 
         Args:
-            values: Ring width measurements (from bark to pith, outer to inner).
+            values: Ring-width measurements. By default interpreted as
+                oldest-to-newest (``orientation="pith_to_bark"``); pass
+                ``orientation="bark_to_pith"`` for a series measured bark inward.
             sample_name: Identifier for the sample.
             has_bark_edge: Whether sample includes the outermost ring (bark).
             species_filter: Only match against these species.
@@ -144,11 +196,16 @@ class CrossdateMatcher:
             detrend_method: Method for removing growth trend.
             min_overlap: Minimum overlapping years required.
             max_references: Maximum number of references to try.
+            orientation: Order of ``values`` (``"pith_to_bark"`` or
+                ``"bark_to_pith"``); normalized internally to oldest-first.
+            has_sapwood: Whether incomplete sapwood is present (no bark edge).
+            sapwood_count: Number of sapwood rings present, if known.
 
         Returns:
             CrossdateReport with all match results and assessment.
         """
-        values = np.asarray(values, dtype=np.float64)
+        # Normalize to canonical oldest-to-newest order before anything else.
+        values = normalize_orientation(values, orientation)
 
         # Validate input
         if len(values) < min_overlap:
@@ -217,7 +274,7 @@ class CrossdateMatcher:
                 )
                 if match is not None:
                     all_matches.append(match)
-            except Exception as e:
+            except Exception:
                 continue  # Skip problematic references
 
         # Sort by t-value
@@ -235,6 +292,22 @@ class CrossdateMatcher:
         # Assess consensus
         self._assess_consensus(report)
 
+        # If the best match is imperfect, check whether a single missing/false
+        # ring would explain the misfit, and point the user at its location.
+        if report.matches and report.matches[0].correlation < 0.7:
+            self._add_missing_ring_hint(report, sample_std)
+
+        # Interpret the dated last ring as a felling date.
+        if report.consensus_year is not None:
+            best_species = report.matches[0].reference_species if report.matches else None
+            report.felling_estimate = estimate_felling(
+                last_ring_year=report.consensus_year,
+                has_bark_edge=has_bark_edge,
+                has_sapwood=has_sapwood,
+                sapwood_count=sapwood_count,
+                species=best_species,
+            )
+
         return report
 
     def _match_against_reference(
@@ -247,40 +320,10 @@ class CrossdateMatcher:
     ) -> Optional[MatchResult]:
         """Match sample against a single reference chronology."""
 
-        # Load the reference data
-        data = self.index.load_chronology(meta)
-
-        if data is None:
+        master = self._get_master(meta)
+        if master is None:
             return None
-
-        # Get reference values and years
-        if isinstance(data, Chronology):
-            ref_values = data.values
-            ref_start = data.start_year
-
-            # Detrend/standardize reference (CRN files are often already indexed)
-            if np.mean(ref_values) > 500:  # Likely scaled to 1000
-                ref_std = ref_values / 1000.0
-            else:
-                ref_std = standardize(ref_values)
-        elif isinstance(data, RWLFile):
-            # For RWL files, build a master chronology
-            if not data.series:
-                return None
-
-            # Get chronology
-            df = data.to_dataframe()
-            ref_values = df.mean(axis=1).values
-            ref_start = int(df.index.min())
-
-            # Detrend/standardize
-            try:
-                detrended, _ = detrend_series(ref_values)
-                ref_std = standardize(detrended)
-            except Exception:
-                ref_std = standardize(ref_values)
-        else:
-            return None
+        ref_std, ref_start = master
 
         # Find best match
         best_matches = find_best_match(
@@ -292,9 +335,10 @@ class CrossdateMatcher:
 
         best = best_matches[0]
 
-        # Filter by era
-        sample_end = best.position + len(sample) - 1
-        if best.position < era_start - len(sample) or sample_end > era_end + 50:
+        # Filter by era: the dated last ring (felling year candidate) must fall
+        # within the requested window.
+        last_ring_year = best.position + len(sample) - 1
+        if not (era_start <= last_ring_year <= era_end):
             return None
 
         # Calculate segment correlations for detailed analysis
@@ -322,8 +366,91 @@ class CrossdateMatcher:
             overlap=best.overlap,
             gleichlauf=best.gleichlauf,
             confidence=dating_confidence(best),
+            glk_p_value=gleichlauf_significance(best.gleichlauf, best.overlap),
             segment_correlations=seg_corrs,
         )
+
+    def _get_master(self, meta: ChronologyMetadata) -> Optional[tuple[np.ndarray, int]]:
+        """
+        Return a standardized master chronology for a reference, building it once.
+
+        RWL files are turned into a site master by detrending **each** series to
+        a dimensionless index and then taking a robust (biweight) mean of the
+        indices -- not by averaging raw widths, which would leave each tree's
+        age-related growth trend in the master and produce spurious matches.
+
+        Args:
+            meta: Index entry for the reference file.
+
+        Returns:
+            ``(standardized_values, start_year)`` or ``None`` if it cannot be built.
+        """
+        cached = self._master_cache.get(meta.filepath)
+        if cached is not None or meta.filepath in self._master_cache:
+            return cached
+
+        result: Optional[tuple[np.ndarray, int]] = None
+        data = self.index.load_chronology(meta)
+
+        if isinstance(data, Chronology) and data.values is not None and len(data.values):
+            # CRN files are already standardized indices (often scaled by 1000).
+            ref_values = np.asarray(data.values, dtype=np.float64)
+            ref_std = ref_values / 1000.0 if np.nanmean(ref_values) > 500 else ref_values
+            result = (ref_std, data.start_year)
+
+        elif isinstance(data, RWLFile) and data.series:
+            series_list: list[np.ndarray] = []
+            years_list: list[np.ndarray] = []
+            for s in data.series.values():
+                if s.length < 10:
+                    continue
+                try:
+                    detrended, _ = detrend_series(s.values, method=DetrendMethod.SPLINE)
+                    series_list.append(standardize(detrended, method="ratio"))
+                    years_list.append(s.years)
+                except Exception:
+                    continue
+            if series_list:
+                years, chron, depth = build_chronology(
+                    series_list, years_list, method="biweight"
+                )
+                valid = ~np.isnan(chron)
+                if np.any(valid):
+                    first = int(np.argmax(valid))
+                    last = len(chron) - int(np.argmax(valid[::-1]))
+                    result = (chron[first:last], int(years[first]))
+
+        self._master_cache[meta.filepath] = result
+        return result
+
+    def _add_missing_ring_hint(self, report: CrossdateReport, sample_std: np.ndarray):
+        """Add a warning if a missing/false ring likely explains a weak match."""
+        from .correlator import detect_missing_ring
+
+        best = report.matches[0]
+        meta = next(
+            (m for m in self.index.entries if m.site_name == best.reference_name), None
+        )
+        if meta is None:
+            return
+        master = self._get_master(meta)
+        if master is None:
+            return
+        ref_std, ref_start = master
+        offset = best.proposed_start_year - ref_start
+        if offset < 0 or offset + len(sample_std) + 1 > len(ref_std):
+            return
+        hint = detect_missing_ring(
+            sample_std, ref_std[offset : offset + len(sample_std) + 20]
+        )
+        if hint is not None and hint.gain >= 0.1:
+            year = best.proposed_start_year + hint.index
+            report.warnings.append(
+                f"Possible {hint.kind} ring near year {year} (sample ring "
+                f"{hint.index + 1}): re-aligning there raises correlation from "
+                f"{hint.baseline_correlation:.2f} to {hint.improved_correlation:.2f}. "
+                "Re-examine the measurements in that region."
+            )
 
     def _assess_consensus(self, report: CrossdateReport):
         """Assess consensus among top matches."""
@@ -401,11 +528,11 @@ class CrossdateMatcher:
                     "Check measurements in these regions."
                 )
 
-        # Geographic diversity warning
-        states = set(m.reference_state for m in good_matches[:5])
+        # Geographic diversity warning (only when state metadata is available).
+        states = {m.reference_state for m in good_matches[:5] if m.reference_state}
         if len(states) == 1:
             report.warnings.append(
-                f"All top matches from single state ({list(states)[0]}). "
+                f"All top matches from single state ({next(iter(states))}). "
                 "Geographic diversity would strengthen confidence."
             )
 

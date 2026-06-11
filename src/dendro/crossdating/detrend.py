@@ -18,9 +18,7 @@ from enum import Enum
 from typing import Optional
 
 import numpy as np
-from scipy import signal
 from scipy.optimize import curve_fit
-from scipy.interpolate import UnivariateSpline
 
 
 class DetrendMethod(Enum):
@@ -184,33 +182,64 @@ def _fit_cubic_spline(
     y: np.ndarray,
     mask: np.ndarray,
     period: float,
+    freq_response: float = 0.5,
 ) -> np.ndarray:
     """
-    Fit a cubic smoothing spline with specified frequency response.
+    Fit a Cook & Peters (1981) cubic smoothing spline.
+
+    This is the dendrochronology-standard "n-year spline": a cubic smoothing
+    spline whose amplitude frequency response equals ``freq_response`` (50% by
+    convention) at a wavelength of ``period`` years. It is implemented as the
+    Whittaker/Reinsch smoother ``g = (I + lambda * D'D)^-1 y`` where ``D`` is the
+    second-difference operator, which is mathematically equivalent to the
+    natural cubic smoothing spline on unit-spaced data.
+
+    The penalty's transfer magnitude is ``(2 - 2 cos w)`` per the second
+    difference, so the smoother response is ``H(w) = 1 / (1 + lambda (2-2cos w)^2)``.
+    Setting ``H = freq_response`` at ``w0 = 2*pi/period`` gives
+    ``lambda = (1/freq_response - 1) / (2 - 2 cos w0)^2``.
 
     Args:
-        period: Wavelength at which 50% of variance is retained.
+        x: Sample index positions (unused beyond length; data are unit-spaced).
+        y: Raw ring-width values.
+        mask: Boolean mask of valid (positive, non-NaN) values.
+        period: Cutoff wavelength in years (e.g. 2/3 of the series length).
+        freq_response: Fraction of variance retained at ``period`` (default 0.5).
+
+    Returns:
+        The fitted growth curve over the full series length (strictly positive).
     """
-    # Convert period to smoothing parameter
-    # Approximate relationship between period and smoothing
+    from scipy.sparse import diags, identity
+    from scipy.sparse.linalg import spsolve
+
     n = len(y)
-    s = n / (period / 2)  # Smoothing factor
+    yf = np.asarray(y, dtype=np.float64).copy()
+
+    # Linearly interpolate masked-out points so the smoother stays well-posed.
+    if not np.all(mask):
+        if np.sum(mask) < 2:
+            return np.full(n, max(np.nanmean(yf[mask]) if np.any(mask) else 1.0, 0.01))
+        idx = np.arange(n)
+        yf[~mask] = np.interp(idx[~mask], idx[mask], yf[mask])
+
+    if n < 4:
+        return np.maximum(np.full(n, np.mean(yf)), 0.01)
+
+    # Keep the cutoff wavelength physically meaningful for the series length.
+    period = float(np.clip(period, 4.0, max(4.0, 2.0 * n)))
+    omega0 = 2.0 * np.pi / period
+    amp = 2.0 - 2.0 * np.cos(omega0)  # second-difference transfer magnitude
+    lam = (1.0 / freq_response - 1.0) / (amp * amp)
 
     try:
-        spline = UnivariateSpline(
-            x[mask],
-            y[mask],
-            s=s * np.var(y[mask]),
-            k=3,
-        )
-        curve = spline(x)
+        e = np.ones(n)
+        d2 = diags([e[:-2], -2.0 * e[1:-1], e[2:]], [0, 1, 2], shape=(n - 2, n))
+        system = (identity(n, format="csc") + lam * (d2.transpose() @ d2)).tocsc()
+        curve = spsolve(system, yf)
         return np.maximum(curve, 0.01)
-
     except Exception:
-        # Fall back to linear
         coeffs = np.polyfit(x[mask], y[mask], 1)
-        curve = np.polyval(coeffs, x)
-        return np.maximum(curve, 0.01)
+        return np.maximum(np.polyval(coeffs, x), 0.01)
 
 
 def standardize(
@@ -271,7 +300,6 @@ def prewhiten(values: np.ndarray, order: int = 1) -> np.ndarray:
 
     # Fit AR model using Yule-Walker equations
     try:
-        from scipy.signal import lfilter
 
         # Estimate AR coefficients
         r = np.correlate(values[valid_mask] - np.mean(values[valid_mask]),

@@ -16,7 +16,6 @@ from typing import Optional
 import click
 import numpy as np
 
-
 # Default data directory
 DEFAULT_DATA_DIR = Path.cwd() / "data"
 
@@ -72,7 +71,7 @@ def download(states: str, species: str, output: Optional[str], overwrite: bool):
     state_list = [s.strip().lower() for s in states.split(",")]
     species_list = [s.strip().upper() for s in species.split(",")]
 
-    click.echo(f"Downloading chronologies for:")
+    click.echo("Downloading chronologies for:")
     click.echo(f"  States: {', '.join(s.upper() for s in state_list)}")
     click.echo(f"  Species: {', '.join(species_list)}")
     click.echo(f"  Output: {output_dir}")
@@ -120,8 +119,8 @@ def measure(image: str, dpi: int, output: Optional[str], auto: bool):
     Example:
         dendro measure sample.tiff --dpi=2400 --output=sample.csv
     """
-    from ..imaging.viewer import MeasurementViewer
     from ..imaging.path_sampler import widths_to_csv
+    from ..imaging.viewer import MeasurementViewer
 
     image_path = Path(image)
 
@@ -151,7 +150,7 @@ def measure(image: str, dpi: int, output: Optional[str], auto: bool):
         viewer.show()
 
         if widths is not None and len(widths) > 0:
-            csv_output = widths_to_csv(widths, output_path=output_path)
+            widths_to_csv(widths, output_path=output_path)
             click.echo(f"\nSaved {len(widths)} ring measurements to {output_path}")
         else:
             click.echo("No measurements recorded.")
@@ -201,6 +200,23 @@ def measure(image: str, dpi: int, output: Optional[str], auto: bool):
     help="Sample includes bark edge (for exact felling year)."
 )
 @click.option(
+    "--orientation",
+    type=click.Choice(["pith_to_bark", "bark_to_pith"]),
+    default="pith_to_bark",
+    help="Order of the ring series (oldest-first vs bark-first)."
+)
+@click.option(
+    "--has-sapwood/--no-sapwood",
+    default=False,
+    help="Incomplete sapwood present (no bark edge) for a felling-year range."
+)
+@click.option(
+    "--sapwood-count",
+    type=int,
+    default=None,
+    help="Number of sapwood rings present, if known."
+)
+@click.option(
     "--output", "-o",
     type=click.Path(),
     default=None,
@@ -242,6 +258,9 @@ def date(
     species: Optional[str],
     states: Optional[str],
     bark_edge: bool,
+    orientation: str,
+    has_sapwood: bool,
+    sapwood_count: Optional[int],
     output: Optional[str],
     top: int,
     plot: bool,
@@ -263,9 +282,8 @@ def date(
         dendro date beam1.csv beam2.csv beam3.csv --cross-verify
     """
     import pandas as pd
+
     from ..crossdating.matcher import CrossdateMatcher
-    from ..crossdating.detrend import DetrendMethod, detrend_series, standardize
-    from ..crossdating.correlator import sliding_correlation
 
     reference_dir = Path(reference) if reference else DEFAULT_DATA_DIR / "reference"
 
@@ -338,6 +356,9 @@ def date(
         state_filter=state_filter,
         era_start=era_start,
         era_end=era_end,
+        orientation=orientation,
+        has_sapwood=has_sapwood,
+        sapwood_count=sapwood_count,
     )
 
     # Display results
@@ -350,7 +371,9 @@ def date(
     click.echo()
 
     if report.consensus_year:
-        click.echo(f"PROPOSED FELLING YEAR: {report.consensus_year}")
+        click.echo(f"Last ring dated to: {report.consensus_year}")
+        if report.felling_estimate:
+            click.echo(report.felling_estimate.summary())
         click.echo(f"Confidence: {report.consensus_confidence}")
     else:
         click.echo("No confident date could be determined.")
@@ -487,7 +510,7 @@ def parse(rwl_file: str):
     Example:
         dendro parse data/reference/nh/nh001.rwl
     """
-    from ..reference.tucson_parser import parse_rwl_file, parse_crn_file
+    from ..reference.tucson_parser import parse_crn_file, parse_rwl_file
 
     filepath = Path(rwl_file)
 
@@ -556,7 +579,7 @@ def _display_segment_analysis(match, consensus_year: int):
 
 def _display_marker_years(values: np.ndarray, proposed_start_year: int):
     """Detect and display potential marker year matches."""
-    from ..visualization.plots import detect_marker_years, identify_known_markers, MARKER_YEARS
+    from ..visualization.plots import MARKER_YEARS, detect_marker_years, identify_known_markers
 
     click.echo("\nMarker Year Analysis:")
     click.echo("-" * 60)
@@ -660,12 +683,12 @@ def _run_cross_verify(
     if len(unique_years) == 1:
         consensus_year = years[0]
         click.echo(f"✓ STRONG AGREEMENT: All {len(dated_results)} samples date to {consensus_year}")
-        click.echo(f"  This significantly increases confidence in the dating.")
+        click.echo("  This significantly increases confidence in the dating.")
 
         # Calculate combined statistics
         total_t = sum(r.matches[0].t_value if r.matches else 0 for _, _, r in dated_results)
         avg_t = total_t / len(dated_results)
-        click.echo(f"\n  Combined statistics:")
+        click.echo("\n  Combined statistics:")
         click.echo(f"    Samples agreeing: {len(dated_results)}/{len(results)}")
         click.echo(f"    Average t-value: {avg_t:.1f}")
 
@@ -722,8 +745,8 @@ def _run_cross_verify(
 
 def _generate_plots(report, values: np.ndarray, matcher, output_path: Path):
     """Generate and save diagnostic plots."""
-    from ..crossdating.detrend import detrend_series, standardize
     from ..crossdating.correlator import sliding_correlation
+    from ..crossdating.detrend import detrend_series, standardize
     from ..visualization.plots import save_diagnostic_plots
 
     if not report.matches:
