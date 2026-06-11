@@ -1,15 +1,58 @@
 # Dendrochronology Dating Tool
 
-A Python CLI tool for dating historic timber by cross-dating ring width measurements against ITRDB reference chronologies.
+A Python tool and HTTP service for dating historic timber by cross-dating ring width measurements against ITRDB reference chronologies. Usable from the command line or as a cloud-deployable API.
 
 ## Overview
 
 This tool helps determine when trees were felled by:
 1. Extracting ring width measurements from scanned wood cross-sections
 2. Cross-dating against publicly available ITRDB chronologies
-3. Identifying the calendar year of the outermost ring (felling year if bark edge present)
+3. Interpreting the calendar year of the outermost ring as a felling date (exact with bark edge; a range or *terminus post quem* otherwise)
 
 Designed for dating historic New England timber (1600s-1800s), but works for any region with ITRDB coverage.
+
+## Running as a cloud service
+
+The cross-dating engine is exposed as a stateless FastAPI service (the engine is
+used as a library; the API does not shell out to the CLI):
+
+```bash
+pip install -e ".[api]"
+export DENDRO_REFERENCE_DIR=/path/to/itrdb   # directory of .rwl/.crn files
+dendro-api                                   # serves on :8000
+```
+
+Endpoints: `GET /health`, `GET /references`, `POST /date` (JSON ring widths),
+`POST /date/csv` (CSV upload), `POST /parse` (Tucson file upload). Example:
+
+```bash
+curl -X POST http://localhost:8000/date -H 'content-type: application/json' \
+  -d '{"widths": [1.2, 0.9, ...], "has_bark_edge": true, "era_start": 1700, "era_end": 1850}'
+```
+
+Or with Docker (ships the synthetic demo references; mount a real corpus for production):
+
+```bash
+docker build -t dendro . && docker run -p 8000:8000 dendro
+```
+
+### Felling-year interpretation
+
+Dating establishes the year of the **last measured ring**. What that implies for
+the felling date depends on the sample:
+
+- **Bark/waney edge present** → exact felling year.
+- **Sapwood present, no bark edge** → estimated felling-year *range* (species sapwood model).
+- **No sapwood retained** → *terminus post quem* ("felled after").
+
+Pass `--bark-edge/--no-bark-edge`, `--has-sapwood`, and `--sapwood-count` to the
+`dendro date` command (or the corresponding API fields).
+
+### Series orientation
+
+All series are dated in canonical oldest→newest (pith→bark) order. If your
+measurements run bark-inward, pass `--orientation bark_to_pith` and they are
+reversed automatically.
 
 ## Installation
 
@@ -197,7 +240,8 @@ dendrochronology/
 │   └── cli/main.py             # CLI entry point
 ├── data/
 │   └── reference/              # Downloaded ITRDB chronologies
-└── tests/                      # Test suite (43 tests)
+│   └── api/app.py              # FastAPI cloud service
+└── tests/                      # Test suite (83 tests + fixtures)
 ```
 
 ## Species Codes
@@ -268,7 +312,10 @@ source venv/bin/activate
 pytest tests/ -v
 ```
 
-47 tests total, including 4 real-data validation tests using ITRDB chronologies.
+83 tests total. Most run offline against committed synthetic fixtures
+(`tests/fixtures`), including an end-to-end dating test that recovers a known
+felling year. Four additional validation tests use real ITRDB chronologies and
+skip automatically unless that data has been downloaded.
 
 ## Algorithm Validation
 

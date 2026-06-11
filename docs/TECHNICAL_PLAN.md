@@ -7,6 +7,43 @@ software that runs as a service in the cloud.
 
 ---
 
+## Implementation status (this branch)
+
+A first implementation pass has landed the science-correctness fixes, the
+testing/CI foundation, and a deployable service layer. What is **done**:
+
+- **§3.1 Orientation** — canonical oldest→newest enforced end-to-end via
+  `normalize_orientation`; `--orientation` / API field; reversed input recovers
+  the same date (tested).
+- **§3.2 Felling logic** — new `crossdating/felling.py`; reports distinguish
+  exact felling year (bark edge), estimated range (sapwood), and *terminus post
+  quem* (tested).
+- **§3.3 RWL master chronology** — now detrend-per-series → biweight mean of
+  indices, cached. On the synthetic fixture this changed the result from a
+  *confidently wrong* 1739 (r=0.89) to the correct **1789 (r=0.97, HIGH)**.
+- **§3.4 Gleichläufigkeit** — formula corrected, significance test added, folded
+  into the confidence model (tested).
+- **§3.5 Missing rings** — first-cut `detect_missing_ring` locates a likely
+  missing/false ring and the matcher surfaces it as a warning (tested). Full
+  auto-realignment search remains future work.
+- **§3.6 Spline** — replaced with the Cook & Peters cubic smoothing spline;
+  frequency response verified to be 0.5 at the cutoff wavelength (tested).
+- **§3.7/3.8 Parsers/cleanup** — Tucson writer rounding fixed; a writer↔parser
+  round-trip test added; era filtering rationalized to the felling-year window.
+- **§4.2 Imaging** — directional gradient stops double-counting ring boundaries.
+- **Phase 0** — committed deterministic fixtures, CI (ruff + pytest + Docker
+  smoke test), Dockerfile, lockfile, ruff config, SessionStart hook. 79 tests
+  pass offline; the 4 real-ITRDB tests skip without downloaded data.
+- **Phase 2 (spine)** — FastAPI service (`api/app.py`) wrapping the engine as a
+  library, with input validation, a cached reference index, and a Docker image.
+
+Still **outstanding** (tracked below): full missing-ring re-alignment search,
+the browser measurement workflow (Phase 3), a persistent project/database model
+and job queue (the rest of Phase 2), real-corpus reference data management, and
+validation against dplR.
+
+---
+
 ## 1. Executive summary
 
 The repository is a well-organized **prototype** with the right module boundaries
