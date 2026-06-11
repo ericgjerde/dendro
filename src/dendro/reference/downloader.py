@@ -17,7 +17,6 @@ from urllib.parse import urljoin
 import requests
 from tqdm import tqdm
 
-
 # Base URLs for ITRDB data
 ITRDB_MEASUREMENTS_BASE = "https://www.ncei.noaa.gov/pub/data/paleo/treering/measurements/northamerica/usa/"
 ITRDB_CHRONOLOGIES_BASE = "https://www.ncei.noaa.gov/pub/data/paleo/treering/chronologies/northamerica/usa/"

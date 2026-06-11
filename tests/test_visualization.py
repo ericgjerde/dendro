@@ -3,12 +3,11 @@ Tests for the visualization module.
 """
 
 import numpy as np
-import pytest
 
 from dendro.visualization.plots import (
+    MARKER_YEARS,
     detect_marker_years,
     identify_known_markers,
-    MARKER_YEARS,
 )
 
 
@@ -93,10 +92,10 @@ class TestPlotFunctions:
     def test_import_plot_functions(self):
         """All plot functions should be importable."""
         from dendro.visualization.plots import (
-            plot_crossdate_results,
             plot_correlation_profile,
-            plot_segment_analysis,
+            plot_crossdate_results,
             plot_sample_reference_overlay,
+            plot_segment_analysis,
             save_diagnostic_plots,
         )
 

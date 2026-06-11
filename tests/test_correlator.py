@@ -1,15 +1,14 @@
 """Tests for cross-dating correlation algorithms."""
 
 import numpy as np
-import pytest
 
 from dendro.crossdating.correlator import (
-    sliding_correlation,
-    calculate_tvalue,
-    calculate_gleichlauf,
-    find_best_match,
-    dating_confidence,
     CorrelationResult,
+    calculate_gleichlauf,
+    calculate_tvalue,
+    dating_confidence,
+    find_best_match,
+    sliding_correlation,
 )
 
 

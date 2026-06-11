@@ -20,17 +20,16 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .correlator import (
-    CorrelationResult,
-    find_best_match,
-    segment_correlation,
-    dating_confidence,
-    gleichlauf_significance,
-)
-from .detrend import detrend_series, standardize, DetrendMethod, build_chronology
-from .felling import estimate_felling, FellingEstimate
 from ..reference.chronology_index import ChronologyIndex, ChronologyMetadata
-from ..reference.tucson_parser import parse_rwl_file, parse_crn_file, Chronology, RWLFile
+from ..reference.tucson_parser import Chronology, RWLFile
+from .correlator import (
+    dating_confidence,
+    find_best_match,
+    gleichlauf_significance,
+    segment_correlation,
+)
+from .detrend import DetrendMethod, build_chronology, detrend_series, standardize
+from .felling import FellingEstimate, estimate_felling
 
 
 def normalize_orientation(values: np.ndarray, orientation: str) -> np.ndarray:
@@ -108,25 +107,28 @@ class CrossdateReport:
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        """Convert report to dictionary for serialization."""
+        """Convert report to a JSON-serializable dictionary (native types only)."""
         return {
             "sample_name": self.sample_name,
-            "sample_length": self.sample_length,
-            "has_bark_edge": self.has_bark_edge,
+            "sample_length": int(self.sample_length),
+            "has_bark_edge": bool(self.has_bark_edge),
             "detrend_method": self.detrend_method,
-            "consensus_year": self.consensus_year,
+            "consensus_year": int(self.consensus_year) if self.consensus_year is not None else None,
             "consensus_confidence": self.consensus_confidence,
             "felling_estimate": self.felling_estimate.to_dict() if self.felling_estimate else None,
-            "warnings": self.warnings,
+            "warnings": list(self.warnings),
             "matches": [
                 {
                     "reference": m.reference_name,
                     "species": m.reference_species,
                     "state": m.reference_state,
-                    "felling_year": m.felling_year,
-                    "correlation": round(m.correlation, 4),
-                    "t_value": round(m.t_value, 2),
-                    "overlap": m.overlap,
+                    "last_ring_year": int(m.last_ring_year),
+                    "felling_year": int(m.felling_year),
+                    "correlation": round(float(m.correlation), 4),
+                    "t_value": round(float(m.t_value), 2),
+                    "gleichlauf": round(float(m.gleichlauf), 1),
+                    "glk_p_value": float(m.glk_p_value),
+                    "overlap": int(m.overlap),
                     "confidence": m.confidence,
                 }
                 for m in self.matches
@@ -272,7 +274,7 @@ class CrossdateMatcher:
                 )
                 if match is not None:
                     all_matches.append(match)
-            except Exception as e:
+            except Exception:
                 continue  # Skip problematic references
 
         # Sort by t-value
@@ -526,11 +528,11 @@ class CrossdateMatcher:
                     "Check measurements in these regions."
                 )
 
-        # Geographic diversity warning
-        states = set(m.reference_state for m in good_matches[:5])
+        # Geographic diversity warning (only when state metadata is available).
+        states = {m.reference_state for m in good_matches[:5] if m.reference_state}
         if len(states) == 1:
             report.warnings.append(
-                f"All top matches from single state ({list(states)[0]}). "
+                f"All top matches from single state ({next(iter(states))}). "
                 "Geographic diversity would strengthen confidence."
             )
 

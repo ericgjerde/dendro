@@ -1,6 +1,6 @@
 """Tests for felling-year interpretation."""
 
-from dendro.crossdating.felling import estimate_felling, FellingType
+from dendro.crossdating.felling import FellingType, estimate_felling
 
 
 def test_bark_edge_exact():

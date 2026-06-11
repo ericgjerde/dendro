@@ -300,7 +300,6 @@ def prewhiten(values: np.ndarray, order: int = 1) -> np.ndarray:
 
     # Fit AR model using Yule-Walker equations
     try:
-        from scipy.signal import lfilter
 
         # Estimate AR coefficients
         r = np.correlate(values[valid_mask] - np.mean(values[valid_mask]),

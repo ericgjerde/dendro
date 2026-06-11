@@ -6,17 +6,17 @@ Targeted regression tests for the cross-dating correctness fixes:
 - Tucson writer/parser round-trip
 """
 
-import numpy as np
 import tempfile
 from pathlib import Path
 
-from dendro.crossdating.detrend import _fit_cubic_spline
+import numpy as np
+
 from dendro.crossdating.correlator import (
     calculate_gleichlauf,
-    gleichlauf_significance,
     detect_missing_ring,
+    gleichlauf_significance,
 )
-from dendro.crossdating.detrend import standardize
+from dendro.crossdating.detrend import _fit_cubic_spline, standardize
 from dendro.imaging.path_sampler import widths_to_tucson
 from dendro.reference.tucson_parser import parse_rwl_file
 

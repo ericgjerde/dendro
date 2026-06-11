@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from dendro.reference.tucson_parser import parse_rwl_file
 
 FIX = Path(__file__).parent / "fixtures"

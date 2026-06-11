@@ -4,11 +4,11 @@ import numpy as np
 import pytest
 
 from dendro.crossdating.detrend import (
-    detrend_series,
-    standardize,
-    prewhiten,
-    build_chronology,
     DetrendMethod,
+    build_chronology,
+    detrend_series,
+    prewhiten,
+    standardize,
 )
 
 

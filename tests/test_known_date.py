@@ -6,7 +6,6 @@ date samples when we know the true answer.
 """
 
 import numpy as np
-import pytest
 
 from dendro.crossdating.correlator import find_best_match
 from dendro.crossdating.detrend import standardize
@@ -22,7 +21,6 @@ class TestKnownDateRecovery:
         # Create a "reference chronology" with distinctive pattern
         # Mix of periodic signal and random component
         n_years = 200
-        years = np.arange(1700, 1700 + n_years)
 
         # Climate-like signal: multi-frequency sine waves
         signal = (

@@ -5,9 +5,10 @@ These tests verify the cross-dating algorithm can correctly recover
 known dates from actual tree ring data.
 """
 
-import pytest
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import pytest
 
 # Skip if reference data not downloaded
 REF_DIR = Path(__file__).parent.parent / "data" / "reference"
@@ -28,7 +29,7 @@ class TestRealDataValidation:
 
     def _build_site_master(self, rwl, exclude_series_id):
         """Build master chronology from all series except one."""
-        from dendro.crossdating.detrend import detrend_series, standardize, DetrendMethod
+        from dendro.crossdating.detrend import DetrendMethod, detrend_series, standardize
 
         other_series = [(sid, s) for sid, s in rwl.series.items()
                        if sid != exclude_series_id and s.length >= 50]
@@ -56,9 +57,9 @@ class TestRealDataValidation:
 
     def _crossdate_within_site(self, rwl_path):
         """Test cross-dating one core against others from same site."""
-        from dendro.reference.tucson_parser import parse_rwl_file
         from dendro.crossdating.correlator import find_best_match
-        from dendro.crossdating.detrend import detrend_series, standardize, DetrendMethod
+        from dendro.crossdating.detrend import DetrendMethod, detrend_series, standardize
+        from dendro.reference.tucson_parser import parse_rwl_file
 
         rwl = parse_rwl_file(rwl_path)
 

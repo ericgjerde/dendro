@@ -277,10 +277,7 @@ def widths_to_tucson(
     idx = 0
 
     while idx < len(widths_001mm):
-        # Start of decade
-        decade_start = (year // 10) * 10
-
-        # How many values fit in this decade
+        # How many values fit in the current decade row
         values_in_decade = min(10 - (year % 10), len(widths_001mm) - idx)
 
         # Build line

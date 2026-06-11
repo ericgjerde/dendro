@@ -9,10 +9,10 @@ Provides diagnostic plots for validating dating results:
 """
 
 from .plots import (
-    plot_crossdate_results,
     plot_correlation_profile,
-    plot_segment_analysis,
+    plot_crossdate_results,
     plot_sample_reference_overlay,
+    plot_segment_analysis,
     save_diagnostic_plots,
 )
 

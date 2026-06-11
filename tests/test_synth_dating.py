@@ -16,8 +16,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from dendro.reference.chronology_index import ChronologyIndex
 from dendro.crossdating.matcher import CrossdateMatcher
+from dendro.reference.chronology_index import ChronologyIndex
 
 FIX = Path(__file__).parent / "fixtures"
 REF = FIX / "reference"
