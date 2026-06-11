@@ -256,8 +256,9 @@ def widths_to_tucson(
     Returns:
         Tucson format string.
     """
-    # Convert mm to 0.01mm units (standard Tucson)
-    widths_001mm = (widths_mm * 100).astype(int)
+    # Convert mm to 0.01mm units (standard Tucson). Round rather than truncate
+    # so a 1.27 mm ring becomes 127, not 126.
+    widths_001mm = np.rint(np.asarray(widths_mm, dtype=np.float64) * 100).astype(int)
 
     # Reverse if needed (Tucson goes from oldest to newest)
     # Our widths are bark-to-pith (newest to oldest), so reverse

@@ -201,6 +201,23 @@ def measure(image: str, dpi: int, output: Optional[str], auto: bool):
     help="Sample includes bark edge (for exact felling year)."
 )
 @click.option(
+    "--orientation",
+    type=click.Choice(["pith_to_bark", "bark_to_pith"]),
+    default="pith_to_bark",
+    help="Order of the ring series (oldest-first vs bark-first)."
+)
+@click.option(
+    "--has-sapwood/--no-sapwood",
+    default=False,
+    help="Incomplete sapwood present (no bark edge) for a felling-year range."
+)
+@click.option(
+    "--sapwood-count",
+    type=int,
+    default=None,
+    help="Number of sapwood rings present, if known."
+)
+@click.option(
     "--output", "-o",
     type=click.Path(),
     default=None,
@@ -242,6 +259,9 @@ def date(
     species: Optional[str],
     states: Optional[str],
     bark_edge: bool,
+    orientation: str,
+    has_sapwood: bool,
+    sapwood_count: Optional[int],
     output: Optional[str],
     top: int,
     plot: bool,
@@ -338,6 +358,9 @@ def date(
         state_filter=state_filter,
         era_start=era_start,
         era_end=era_end,
+        orientation=orientation,
+        has_sapwood=has_sapwood,
+        sapwood_count=sapwood_count,
     )
 
     # Display results
@@ -350,7 +373,9 @@ def date(
     click.echo()
 
     if report.consensus_year:
-        click.echo(f"PROPOSED FELLING YEAR: {report.consensus_year}")
+        click.echo(f"Last ring dated to: {report.consensus_year}")
+        if report.felling_estimate:
+            click.echo(report.felling_estimate.summary())
         click.echo(f"Confidence: {report.consensus_confidence}")
     else:
         click.echo("No confident date could be determined.")

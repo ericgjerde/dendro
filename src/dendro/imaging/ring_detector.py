@@ -248,14 +248,13 @@ def _calculate_gradient(profile: np.ndarray) -> np.ndarray:
         mode='same'
     )
 
-    # Calculate gradient (first derivative)
-    gradient = np.gradient(smoothed)
-
-    # We want to detect transitions from light to dark (ring boundaries)
-    # Take absolute value to catch both directions
-    gradient = np.abs(gradient)
-
-    return gradient
+    # Signed first derivative. A tree-ring (year) boundary is a *single*
+    # transition -- the abrupt step from dense dark latewood at the end of one
+    # year to light earlywood at the start of the next. Returning the signed
+    # gradient lets the boundary finder pick that one polarity, instead of
+    # taking the absolute value (which fires on both the earlywood->latewood and
+    # latewood->earlywood edges and double-counts every ring).
+    return np.gradient(smoothed)
 
 
 def _find_boundaries(
@@ -276,25 +275,26 @@ def _find_boundaries(
     Returns:
         List of boundary positions (pixel indices).
     """
-    # Normalize gradient
-    grad_max = np.max(gradient)
-    if grad_max == 0:
+    gradient = np.asarray(gradient, dtype=np.float64)
+
+    # Pick the transition polarity that carries more energy and detect peaks of
+    # that single direction only (avoids counting both edges of each ring).
+    pos_energy = float(np.sum(gradient[gradient > 0]))
+    neg_energy = float(-np.sum(gradient[gradient < 0]))
+    signal = gradient if pos_energy >= neg_energy else -gradient
+
+    grad_max = np.max(signal)
+    if grad_max <= 0:
         return []
 
-    grad_norm = gradient / grad_max
-
-    # Find peaks above threshold
+    grad_norm = signal / grad_max
     threshold_value = threshold * 0.5  # Scale threshold
 
-    # Simple peak finding
-    peaks = []
-    for i in range(min_distance, len(gradient) - min_distance):
-        # Check if this is a local maximum
-        window = gradient[max(0, i - min_distance // 2):
-                         min(len(gradient), i + min_distance // 2 + 1)]
-
-        if gradient[i] == np.max(window) and grad_norm[i] > threshold_value:
-            # Check distance from last peak
+    peaks: list[int] = []
+    for i in range(min_distance, len(signal) - min_distance):
+        window = signal[max(0, i - min_distance // 2):
+                        min(len(signal), i + min_distance // 2 + 1)]
+        if signal[i] == np.max(window) and grad_norm[i] > threshold_value:
             if not peaks or (i - peaks[-1]) >= min_distance:
                 peaks.append(i)
 
