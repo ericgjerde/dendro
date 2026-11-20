@@ -7,10 +7,10 @@ Data Bank (ITRDB). This module handles both:
 - .crn files: Chronology files (site means with sample depth)
 
 Format specification:
-- Fixed-width columns
-- First 8 characters: series ID
-- Characters 9-12: start year (or decade for some formats)
-- Remaining: ring width values (varies by format)
+- RWL: cols 1-8 series ID, cols 9-12 start year, then 6-char integer values.
+  Stop marker is either 999 (0.01 mm precision) or -9999 (0.001 mm precision).
+- CRN: cols 1-6 (standard ITRDB) or 1-8 site ID, next 4 cols decade year,
+  then ten 7-char (4-char value + 3-char sample depth) pairs; 9990 = missing.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ class RingWidthSeries:
     series_id: str
     start_year: int
     end_year: int
-    values: np.ndarray  # Ring widths in 0.01mm units
+    values: np.ndarray  # Ring widths (contiguous from start_year..end_year, NaN for gaps)
 
     @property
     def years(self) -> np.ndarray:
@@ -73,10 +73,13 @@ class Chronology:
 
     def to_dataframe(self) -> pd.DataFrame:
         """Convert to DataFrame with year index."""
-        return pd.DataFrame({
-            "value": self.values,
-            "sample_depth": self.sample_depth,
-        }, index=self.years)
+        return pd.DataFrame(
+            {
+                "value": self.values,
+                "sample_depth": self.sample_depth,
+            },
+            index=self.years,
+        )
 
 
 @dataclass
@@ -104,17 +107,12 @@ class RWLFile:
 
 def parse_rwl_file(filepath: str | Path) -> RWLFile:
     """
-    Parse a Tucson format .rwl file.
+    Parse a Tucson format .rwl file accurately.
 
-    Handles multiple common Tucson format variants:
-    - Standard ITRDB format with fixed columns
-    - NOAA NCEI modified format
-
-    Args:
-        filepath: Path to the .rwl file
-
-    Returns:
-        RWLFile containing all parsed series
+    Respects per-series stop markers (`-9999` vs `999`) so that valid `0.999 mm`
+    measurements (`999`) in 0.001 mm (`-9999`) files are never treated as stop
+    markers, and maps each value to its explicit line calendar year so internal
+    gaps (e.g. broken cores) produce NaNs instead of shifting subsequent years.
     """
     filepath = Path(filepath)
 
@@ -124,57 +122,56 @@ def parse_rwl_file(filepath: str | Path) -> RWLFile:
     rwl = RWLFile()
     rwl.metadata["filename"] = filepath.name
 
-    # Track data for each series as we parse
-    series_data: dict[str, dict] = {}
+    # Collect raw parsed lines per series first so we know each series' stop marker.
+    raw_lines_by_series: dict[str, list[tuple[int, list[int]]]] = {}
+    file_uses_neg9999 = False
 
     for line in lines:
         line = line.rstrip("\n\r")
-
-        # Skip empty lines and obvious header lines
         if not line or len(line) < 12:
             continue
-
-        # Skip header lines (usually marked or contain metadata keywords)
         if line.startswith("#") or "ITRDB" in line.upper():
             continue
 
-        # Parse the line
-        try:
-            parsed = _parse_rwl_line(line)
-            if parsed is None:
-                continue
-
-            series_id, year, values, is_end = parsed
-
-            if series_id not in series_data:
-                series_data[series_id] = {
-                    "start_year": year,
-                    "values": [],
-                }
-
-            # Filter out stop marker (999) and append valid values
-            for v in values:
-                if v == -9999 or v == 999:  # Common stop markers
-                    break
-                series_data[series_id]["values"].append(v)
-
-        except Exception:
-            # Skip unparseable lines
+        parsed = _parse_rwl_line(line)
+        if parsed is None:
             continue
 
-    # Convert accumulated data to RingWidthSeries objects
-    for series_id, data in series_data.items():
-        if data["values"]:
-            values = np.array(data["values"], dtype=np.float64)
-            start_year = data["start_year"]
-            end_year = start_year + len(values) - 1
+        series_id, year, values, _ = parsed
+        if -9999 in values:
+            file_uses_neg9999 = True
+        raw_lines_by_series.setdefault(series_id, []).append((year, values))
 
-            rwl.series[series_id] = RingWidthSeries(
-                series_id=series_id,
-                start_year=start_year,
-                end_year=end_year,
-                values=values,
-            )
+    for series_id, records in raw_lines_by_series.items():
+        series_uses_neg9999 = file_uses_neg9999 or any(-9999 in vals for _, vals in records)
+        stop_marker = -9999 if series_uses_neg9999 else 999
+
+        year_to_value: dict[int, float] = {}
+        for line_year, vals in records:
+            for offset, v in enumerate(vals):
+                if v == stop_marker or v == -9999:
+                    break
+                # Standard Tucson missing-value sentinels inside active series
+                if v < 0:
+                    continue
+                year_to_value[line_year + offset] = float(v)
+
+        if not year_to_value:
+            continue
+
+        start_year = min(year_to_value)
+        end_year = max(year_to_value)
+        length = end_year - start_year + 1
+        values_arr = np.full(length, np.nan, dtype=np.float64)
+        for yr, val in year_to_value.items():
+            values_arr[yr - start_year] = val
+
+        rwl.series[series_id] = RingWidthSeries(
+            series_id=series_id,
+            start_year=start_year,
+            end_year=end_year,
+            values=values_arr,
+        )
 
     return rwl
 
@@ -194,25 +191,22 @@ def _parse_rwl_line(line: str) -> tuple[str, int, list[int], bool] | None:
     if len(line) < 12:
         return None
 
-    # Extract series ID (first 8 chars, stripped)
     series_id = line[:8].strip()
     if not series_id:
         return None
 
-    # Extract year (chars 8-12)
     try:
         year_str = line[8:12].strip()
         year = int(year_str)
     except (ValueError, IndexError):
         return None
 
-    # Parse values (remaining characters in 6-char blocks)
-    values = []
+    values: list[int] = []
     pos = 12
     is_end = False
 
     while pos + 6 <= len(line):
-        val_str = line[pos:pos+6].strip()
+        val_str = line[pos:pos + 6].strip()
         if val_str:
             try:
                 val = int(val_str)
@@ -223,13 +217,14 @@ def _parse_rwl_line(line: str) -> tuple[str, int, list[int], bool] | None:
                 pass
         pos += 6
 
-    # Handle partial final value
     if pos < len(line):
         val_str = line[pos:].strip()
         if val_str:
             try:
                 val = int(val_str)
                 values.append(val)
+                if val == 999 or val == -9999:
+                    is_end = True
             except ValueError:
                 pass
 
@@ -239,95 +234,147 @@ def _parse_rwl_line(line: str) -> tuple[str, int, list[int], bool] | None:
     return series_id, year, values, is_end
 
 
+def _detect_crn_layout(line: str) -> Optional[tuple[int, int]]:
+    """
+    Detect CRN fixed-column layout on a candidate data line.
+
+    Returns ``(id_width, data_start)`` where standard ITRDB CRN uses
+    ``(6, 10)`` (6-char ID, 4-char year, 7-char value/depth pairs) and
+    extended 8-char ID variants use ``(8, 12)``.
+    """
+    if len(line) < 17 or line.startswith("#"):
+        return None
+
+    for id_width in (6, 8):
+        year_slice = line[id_width:id_width + 4].strip()
+        if not year_slice or not re.fullmatch(r"-?\d{3,4}", year_slice):
+            continue
+        data_start = id_width + 4
+        if len(line) < data_start + 7:
+            continue
+        # Verify at least the first 7-char pair parses as two integers (val + depth).
+        first_val = line[data_start:data_start + 4].strip()
+        first_depth = line[data_start + 4:data_start + 7].strip()
+        try:
+            int(first_val)
+            if first_depth:
+                int(first_depth)
+        except ValueError:
+            continue
+        # Extra check for standard 6-char layout: reject header lines like "PORSTD 1 ..."
+        id_part = line[:id_width].strip()
+        if not id_part:
+            continue
+        return (id_width, data_start)
+
+    return None
+
+
 def parse_crn_file(filepath: str | Path) -> Chronology | None:
     """
     Parse a Tucson format .crn chronology file.
 
-    CRN format typically has:
-    - Header lines with site metadata
-    - Data lines with year, index value, and sample depth
-
-    Args:
-        filepath: Path to the .crn file
-
-    Returns:
-        Chronology object or None if parsing fails
+    Supports standard ITRDB 6-char site-ID format (cols 1-6 ID, 7-10 year,
+    11-80 ten 7-char value/depth pairs) as well as 8-char site-ID variants.
+    Preserves exact calendar years across leading/internal `9990` missing codes.
     """
     filepath = Path(filepath)
 
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
+        lines = [line.rstrip("\n\r") for line in f.readlines()]
 
-    lines = content.split("\n")
-
-    # Parse header information
     metadata = _parse_crn_header(lines)
 
-    # Find where data starts (after header lines)
-    data_start = 0
-    for i, line in enumerate(lines):
-        # Data lines typically start with the site code followed by year
-        if len(line) >= 12:
-            # Check if this looks like a data line
-            try:
-                year_part = line[8:12].strip()
-                if year_part and year_part.isdigit():
-                    data_start = i
-                    break
-            except (IndexError, ValueError):
-                continue
+    year_to_val: dict[int, float] = {}
+    year_to_depth: dict[int, int] = {}
+    site_id: Optional[str] = None
+    detected_layout: Optional[tuple[int, int]] = None
 
-    # Parse data lines
-    years = []
-    values = []
-    sample_depths = []
-    site_id = None
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        # Skip standard 3-line Tucson headers (e.g. "PORSTD 1 ...", "PORSTD 2 ...", "PORSTD 3 ...")
+        if len(line) >= 8 and line[6:8] in {" 1", " 2", " 3"} and not line[8:12].strip().isdigit():
+            continue
 
-    for line in lines[data_start:]:
-        if len(line) < 18:
+        layout = detected_layout or _detect_crn_layout(line)
+        if layout is None:
+            continue
+
+        id_width, data_start = layout
+        if len(line) < data_start + 7:
+            continue
+        if "." in line[data_start:]:
+            continue
+        line_site_id = line[:id_width].strip()
+        if not line_site_id:
+            continue
+        if site_id is not None and line_site_id != site_id:
             continue
 
         try:
-            if site_id is None:
-                site_id = line[:8].strip()
-
-            year = int(line[8:12].strip())
-
-            # Parse value-depth pairs (each pair is typically 7 chars: 4 value + 3 depth)
-            pos = 12
-            while pos + 7 <= len(line):
-                val_str = line[pos:pos+4].strip()
-                depth_str = line[pos+4:pos+7].strip()
-
-                if val_str and val_str != "9990" and val_str != "-999":
-                    try:
-                        val = int(val_str)
-                        depth = int(depth_str) if depth_str else 1
-
-                        years.append(year)
-                        values.append(val)
-                        sample_depths.append(depth)
-                        year += 1
-                    except ValueError:
-                        pass
-                else:
-                    break
-                pos += 7
-
-        except (ValueError, IndexError):
+            decade_year = int(line[id_width:data_start].strip())
+        except ValueError:
             continue
 
-    if not years:
+        if detected_layout is None:
+            detected_layout = layout
+        if site_id is None:
+            site_id = line_site_id
+
+        pos = data_start
+        slot = 0
+        # Standard CRN has up to 10 value/depth pairs per line (7 chars each).
+        while pos + 7 <= len(line) and slot < 10:
+            val_str = line[pos:pos + 4].strip()
+            depth_str = line[pos + 4:pos + 7].strip()
+            pos += 7
+
+            if not val_str or val_str in {"9990", "-999", "-9999"}:
+                slot += 1
+                continue
+
+            try:
+                val = int(val_str)
+                depth = int(depth_str) if depth_str else 1
+            except ValueError:
+                slot += 1
+                continue
+
+            if val == 9990 or val == -999 or depth <= 0:
+                slot += 1
+                continue
+
+            # On a first-decade line starting mid-decade (e.g. year=1703),
+            # some files put year=1703 with values starting at slot 0, while
+            # standard ITRDB puts year=1700 with 9990 padding in slots 0..2.
+            # Using decade_year + slot handles both cleanly!
+            yr = decade_year + slot
+            year_to_val[yr] = float(val)
+            year_to_depth[yr] = depth
+            slot += 1
+
+    if not year_to_val:
         return None
+
+    start_year = min(year_to_val)
+    end_year = max(year_to_val)
+    length = end_year - start_year + 1
+    values_arr = np.full(length, np.nan, dtype=np.float64)
+    depth_arr = np.zeros(length, dtype=np.int32)
+    for yr, val in year_to_val.items():
+        idx = yr - start_year
+        values_arr[idx] = val
+        depth_arr[idx] = year_to_depth[yr]
 
     return Chronology(
         site_id=site_id or filepath.stem,
         site_name=metadata.get("site_name", ""),
         species=metadata.get("species", ""),
-        start_year=min(years),
-        end_year=max(years),
-        values=np.array(values, dtype=np.float64),
-        sample_depth=np.array(sample_depths, dtype=np.int32),
+        start_year=start_year,
+        end_year=end_year,
+        values=values_arr,
+        sample_depth=depth_arr,
         latitude=metadata.get("latitude"),
         longitude=metadata.get("longitude"),
         elevation=metadata.get("elevation"),
@@ -339,30 +386,29 @@ def _parse_crn_header(lines: list[str]) -> dict:
     """Extract metadata from CRN file header lines."""
     metadata = {}
 
-    for line in lines[:20]:  # Check first 20 lines for header info
+    for line in lines[:20]:
         line_upper = line.upper()
 
-        # Look for species code
-        species_match = re.search(r'\b(PIST|TSCA|QUAL|QURU|PCRU|PIRE|PIRI|THOC|ACSA|FRAX)\b', line_upper)
+        species_match = re.search(
+            r"\b(PIST|TSCA|QUAL|QURU|PCRU|PIRE|PIRI|THOC|ACSA|FRAX|CADN)\b",
+            line_upper,
+        )
         if species_match:
             metadata["species"] = species_match.group(1)
 
-        # Look for coordinates
-        lat_match = re.search(r'(\d{2})[°\s](\d{2})[\'′\s]?\s*N', line, re.IGNORECASE)
+        lat_match = re.search(r"(\d{2})[°\s](\d{2})['′\s]?\s*N", line, re.IGNORECASE)
         if lat_match:
             metadata["latitude"] = float(lat_match.group(1)) + float(lat_match.group(2)) / 60
 
-        lon_match = re.search(r'(\d{2,3})[°\s](\d{2})[\'′\s]?\s*W', line, re.IGNORECASE)
+        lon_match = re.search(r"(\d{2,3})[°\s](\d{2})['′\s]?\s*W", line, re.IGNORECASE)
         if lon_match:
             metadata["longitude"] = -(float(lon_match.group(1)) + float(lon_match.group(2)) / 60)
 
-        # Look for elevation
-        elev_match = re.search(r'(\d{2,4})\s*M\b', line_upper)
+        elev_match = re.search(r"(\d{2,4})\s*M\b", line_upper)
         if elev_match:
             metadata["elevation"] = float(elev_match.group(1))
 
-        # State codes
-        for state in ["NH", "VT", "ME", "MA", "CT", "RI", "NY", "PA"]:
+        for state in ["NH", "VT", "ME", "MA", "CT", "RI", "NY", "PA", "TN"]:
             if f" {state} " in line_upper or line_upper.endswith(f" {state}"):
                 metadata["state"] = state
                 break
@@ -389,13 +435,10 @@ def load_measurements_csv(filepath: str | Path) -> pd.DataFrame:
     filepath = Path(filepath)
     df = pd.read_csv(filepath)
 
-    # Normalize column names
     df.columns = df.columns.str.lower().str.strip()
 
-    # Handle year column
     if "year" not in df.columns:
         if len(df.columns) >= 2:
-            # Assume first column is year if it looks like years
             first_col = df.iloc[:, 0]
             if first_col.dtype in [np.int64, np.float64] and first_col.min() > 1000:
                 df = df.rename(columns={df.columns[0]: "year"})
@@ -404,18 +447,17 @@ def load_measurements_csv(filepath: str | Path) -> pd.DataFrame:
         else:
             df["year"] = range(1, len(df) + 1)
 
-    # Handle width column
     if "width" not in df.columns:
         if "width_mm" in df.columns:
             df = df.rename(columns={"width_mm": "width"})
-            return df[[col for col in ["year", "calendar_year", "ring_index", "width"] if col in df.columns]].dropna(subset=["width"])
-        # Find the first non-year numeric column
+            return df[
+                [col for col in ["year", "calendar_year", "ring_index", "width"] if col in df.columns]
+            ].dropna(subset=["width"])
         for col in df.columns:
             if col not in {"year", "calendar_year", "ring_index"} and df[col].dtype in [np.int64, np.float64]:
                 df = df.rename(columns={col: "width"})
                 break
 
-    # Ensure we have the required columns
     if "width" not in df.columns:
         raise ValueError("Could not identify ring width column in CSV")
 

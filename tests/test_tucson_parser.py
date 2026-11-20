@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 
 from dendro.reference.tucson_parser import (
+    parse_crn_file,
     parse_rwl_file,
     _parse_rwl_line,
     RingWidthSeries,
@@ -163,3 +164,69 @@ class TestMasterChronology:
         assert master[1800] == 150
         assert master[1801] == 150
         assert master[1802] == 150
+
+
+class TestTucsonParserRegressions:
+    """Regression tests for precision stop markers, internal gaps, and CRN format."""
+
+    def test_neg9999_rwl_preserves_mid_series_999_width(self, tmp_path: Path):
+        """A 0.999 mm measurement (999) in a -9999 file must NOT terminate the decade."""
+        content = (
+            "CORE01  1950   934  1084   999  1762  1223  1489  1606  1098  2077  1069\n"
+            "CORE01  1960  1582  1774 -9999\n"
+        )
+        rwl_path = tmp_path / "neg9999.rwl"
+        rwl_path.write_text(content)
+
+        rwl = parse_rwl_file(rwl_path)
+        series = rwl.series["CORE01"]
+        assert series.start_year == 1950
+        assert series.end_year == 1961
+        assert series.length == 12
+        assert series.values[2] == 999.0
+        assert series.values[10] == 1582.0
+        assert series.values[11] == 1774.0
+
+    def test_rwl_internal_gap_inserts_nans_without_shifting_years(self, tmp_path: Path):
+        """A break between segments must produce NaNs rather than shifting later years."""
+        content = (
+            "GAP01   1920  1000  1100  1200 -9999\n"
+            "GAP01   1930  1300  1400 -9999\n"
+        )
+        rwl_path = tmp_path / "gap.rwl"
+        rwl_path.write_text(content)
+
+        rwl = parse_rwl_file(rwl_path)
+        series = rwl.series["GAP01"]
+        assert series.start_year == 1920
+        assert series.end_year == 1931
+        assert series.length == 12
+        assert series.values[0] == 1000.0
+        assert np.all(np.isnan(series.values[3:10]))
+        assert series.values[10] == 1300.0
+        assert series.values[11] == 1400.0
+
+    def test_parse_standard_6char_crn_with_padding_and_trailer(self, tmp_path: Path):
+        """Standard ITRDB 6-char CRN format with 9990 padding and decimal trailer."""
+        content = (
+            "PORSTD 1 Porters Creek                                       CADN\n"
+            "PORSTD 2 Tennessee    Chestnut          1000M  3540-08223    __    1703 1712\n"
+            "PORSTD 3 D.Stahle\n"
+            "STNDRD17009990  09990  09990  01100  21050  2 980  31020  3 990  31010  41040  4\n"
+            "STNDRD1710 970  41030  41060  39990  09990  09990  09990  09990  09990  09990  0\n"
+            "PORSTD  10  .238  .110  .1061.000\n"
+        )
+        crn_path = tmp_path / "test.crn"
+        crn_path.write_text(content)
+
+        chron = parse_crn_file(crn_path)
+        assert chron is not None
+        assert chron.site_id == "STNDRD"
+        assert chron.start_year == 1703
+        assert chron.end_year == 1712
+        assert chron.length == 10
+        assert chron.values[0] == 1100.0
+        assert chron.values[-1] == 1060.0
+        assert chron.sample_depth[0] == 2
+        assert chron.sample_depth[-1] == 3
+

@@ -13,13 +13,18 @@ import numpy as np
 import pandas as pd
 
 from ..materials.catalog import infer_material_group_from_species
-from .correlator import CorrelationResult, find_best_match, segment_correlation
-from .detrend import DetrendMethod, detrend_series, standardize
+from .correlator import (
+    CorrelationResult,
+    _compute_sliding_stats,
+    segment_correlation,
+)
+from .detrend import DetrendMethod, crossdate_transform, detrend_series, standardize
 from ..reference.chronology_index import ChronologyIndex, ReferenceManifestEntry
 
 
 POLICY_VERSION = "2026.04-assisted-ranking-v1"
 YEAR_CONSENSUS_WINDOW = 2
+TOP_PEAKS_PER_REFERENCE = 8
 SPARSE_REFERENCE_WARNING_THRESHOLD = 8
 SPARSE_REFERENCE_FORCE_BROAD_SEARCH_THRESHOLD = 3
 GENUS_FALLBACK_MIN_REFERENCES = 8
@@ -244,8 +249,9 @@ class CrossdateMatcher:
         era_end: int = 1900,
         detrend_method: DetrendMethod = DetrendMethod.SPLINE,
         min_overlap: int = 30,
-        max_references: int = 50,
+        max_references: int = 250,
         top_n: int = 10,
+        allow_sparse_fallback: bool = True,
     ) -> DatingReport:
         values = np.asarray(values, dtype=np.float64)
         warnings: list[str] = []
@@ -277,6 +283,7 @@ class CrossdateMatcher:
             max_year=era_end,
             min_overlap=min_overlap,
             max_references=max_references,
+            allow_sparse_fallback=allow_sparse_fallback,
         )
         warnings.extend(search_plan.warnings)
 
@@ -300,13 +307,21 @@ class CrossdateMatcher:
                 },
             )
 
+        use_high_pass = detrend_method == DetrendMethod.SPLINE
         orientation_runs = self._resolve_orientations(values, orientation)
         best_run: Optional[tuple[str, list[DatingCandidate], np.ndarray]] = None
 
         for assumed_orientation, normalized_values in orientation_runs:
             try:
-                detrended, _ = detrend_series(normalized_values, method=detrend_method)
-                sample_std = standardize(detrended, method="zscore")
+                if use_high_pass:
+                    sample_std = crossdate_transform(
+                        normalized_values,
+                        spline_period=20.0,
+                        prewhiten_order=1,
+                    )
+                else:
+                    detrended, _ = detrend_series(normalized_values, method=detrend_method)
+                    sample_std = standardize(detrended, method="zscore")
             except Exception as exc:
                 warnings.append(f"Detrending failed for {assumed_orientation}: {exc}")
                 continue
@@ -321,6 +336,7 @@ class CrossdateMatcher:
                 top_n=top_n,
                 species_filter=requested_species,
                 state_filter=requested_states,
+                use_high_pass=use_high_pass,
             )
 
             if best_run is None:
@@ -357,6 +373,11 @@ class CrossdateMatcher:
             ranked_candidates[0].is_recommended = self._is_recommended(
                 ranked_candidates[0],
                 recommendation_blocked=search_plan.recommendation_blocked,
+            )
+            ranked_candidates = self._select_top_candidates(
+                ranked_candidates,
+                top_n=top_n,
+                is_recommended=ranked_candidates[0].is_recommended,
             )
         status = self._determine_status(ranked_candidates, warnings)
 
@@ -412,6 +433,7 @@ class CrossdateMatcher:
         max_year: int,
         min_overlap: int,
         max_references: int,
+        allow_sparse_fallback: bool = True,
     ) -> SearchPlan:
         warnings: list[str] = []
         lanes: list[SearchLane] = []
@@ -481,7 +503,7 @@ class CrossdateMatcher:
             )
 
         fallback_species: set[str] = set(species_filter)
-        if sparse_coverage:
+        if sparse_coverage and allow_sparse_fallback:
             genus_lane = self._build_genus_fallback_lane(
                 species_filter=species_filter,
                 state_filter=state_filter,
@@ -523,23 +545,42 @@ class CrossdateMatcher:
                     )
 
         if primary_count == 0:
-            warnings.append(
-                "No same-species references matched the requested filters. Broader fallback lanes were used."
-            )
+            if allow_sparse_fallback:
+                warnings.append(
+                    "No same-species references matched the requested filters. Broader fallback lanes were used."
+                )
+            else:
+                warnings.append("No same-species references matched the requested filters.")
         elif primary_count <= SPARSE_REFERENCE_FORCE_BROAD_SEARCH_THRESHOLD:
-            warnings.append(
-                f"Same-species coverage is extremely sparse ({primary_count} references). "
-                "Broader fallback lanes were evaluated and recommendation is disabled."
-            )
+            if allow_sparse_fallback:
+                warnings.append(
+                    f"Same-species coverage is extremely sparse ({primary_count} references). "
+                    "Broader fallback lanes were evaluated and recommendation is disabled."
+                )
+            else:
+                warnings.append(
+                    f"Same-species coverage is extremely sparse ({primary_count} references). "
+                    "Recommendation is disabled."
+                )
         elif sparse_coverage:
-            warnings.append(
-                f"Same-species coverage is sparse ({primary_count} references). "
-                "Fallback lanes were evaluated and recommendation is disabled."
-            )
+            if allow_sparse_fallback:
+                warnings.append(
+                    f"Same-species coverage is sparse ({primary_count} references). "
+                    "Fallback lanes were evaluated and recommendation is disabled."
+                )
+            else:
+                warnings.append(
+                    f"Same-species coverage is sparse ({primary_count} references). "
+                    "Recommendation is disabled."
+                )
 
         combined_reference_count = sum(len(lane.entries) for lane in lanes)
         diagnostics = {
-            "search_strategy": "sparse_fallback" if sparse_coverage else "species_primary",
+            "search_strategy": (
+                "sparse_fallback"
+                if (sparse_coverage and allow_sparse_fallback)
+                else "species_primary"
+            ),
             "search_lanes": lane_summaries,
             "sparse_reference_coverage": sparse_coverage,
             "requested_species_filter": list(species_filter),
@@ -649,80 +690,261 @@ class CrossdateMatcher:
         top_n: int,
         species_filter: Optional[list[str]],
         state_filter: Optional[list[str]],
+        use_high_pass: bool = True,
     ) -> list[DatingCandidate]:
-        ranked: list[DatingCandidate] = []
+        n_sample = len(sample_std)
+        min_position = int(era_start) - n_sample + 1
+        max_position = int(era_end) - n_sample + 1
+
+        # Pass 1: Collect top peaks per reference within the requested era and
+        # build a cross-reference calendar-year evidence grid.
+        raw_peaks: list[tuple[SearchLane, ReferenceManifestEntry, np.ndarray, CorrelationResult, float]] = []
+        year_evidence: dict[int, float] = {}
+        year_support_refs: dict[int, set[str]] = {}
+        year_support_families: dict[int, set[str]] = {}
+        seen_ref_ids: set[str] = set()
+
+        primary_lane_count = sum(
+            len(lane.entries) for lane in search_lanes if not lane.fallback
+        )
 
         for lane in search_lanes:
+            if not lane.fallback:
+                lane_weight = 1.0
+            elif lane.name.endswith("_genus_fallback"):
+                lane_weight = 0.40 if primary_lane_count >= 2 else 0.70
+            else:
+                lane_weight = 0.15 if primary_lane_count >= 2 else 0.60
+
             for entry in lane.entries:
-                reference = entry.master_values
+                ref_key = f"{entry.site_id}:{entry.filepath}"
+                if ref_key in seen_ref_ids:
+                    continue
+                seen_ref_ids.add(ref_key)
+
+                reference = entry.master_crossdate_values if use_high_pass else entry.master_values
                 if len(reference) < min_overlap:
                     continue
 
-                best_matches = find_best_match(
+                positions, corrs, t_vals, p_vals, overlaps, glks = _compute_sliding_stats(
                     sample_std,
                     reference,
                     entry.master_start_year,
                     min_overlap=min_overlap,
-                    n_best=1,
+                    min_position=min_position,
+                    max_position=max_position,
+                    compute_glk=True,
                 )
-                if not best_matches:
+                if len(positions) == 0:
                     continue
 
-                best = best_matches[0]
-                proposed_end = best.position + len(sample_std) - 1
-                if proposed_end < era_start or proposed_end > era_end:
-                    continue
+                t_finite = np.where(np.isfinite(t_vals), t_vals, 15.0)
+                t_med = float(np.median(t_finite))
+                t_mad = float(np.median(np.abs(t_finite - t_med))) * 1.4826
+                t_z_arr = (t_finite - t_med) / max(t_mad, 0.5)
 
-                offset = best.position - entry.master_start_year
-                aligned_reference = self._aligned_reference(reference, offset, len(sample_std))
-                seg_corrs = (
-                    segment_correlation(
-                        sample_std,
-                        aligned_reference,
-                        segment_length=min(50, max(20, len(sample_std) // 2)),
-                        lag=max(10, min(25, len(sample_std) // 4)),
+                k = min(TOP_PEAKS_PER_REFERENCE, len(t_vals))
+                top_idx = np.argpartition(t_finite, -k)[-k:]
+                top_idx = top_idx[np.argsort(t_finite[top_idx])[::-1]]
+
+                family_name = self._normalize_reference_family(entry.site_name)
+                kept_any = False
+                for rank_i, idx in enumerate(top_idx):
+                    tf = float(t_finite[idx])
+                    rf = float(corrs[idx])
+                    if rank_i > 0 and (tf <= 2.0 or rf <= 0.12):
+                        continue
+
+                    result = CorrelationResult(
+                        position=int(positions[idx]),
+                        correlation=rf,
+                        t_value=float(t_vals[idx]),
+                        p_value=float(p_vals[idx]),
+                        overlap=int(overlaps[idx]),
+                        gleichlauf=float(glks[idx]),
                     )
-                    if aligned_reference is not None
-                    else []
+                    tz = float(t_z_arr[idx])
+                    raw_peaks.append((lane, entry, reference, result, tz))
+                    kept_any = True
+
+                    if tf > 2.0 and rf > 0.12:
+                        end_yr = int(result.position + n_sample - 1)
+                        ov_ratio = float(result.overlap) / max(n_sample, 1)
+                        contrib = (
+                            max(0.0, tf - 2.0)
+                            * max(0.0, rf)
+                            * (ov_ratio ** 0.75)
+                            * (1.0 + 0.2 * max(0.0, tz - 2.5))
+                            * lane_weight
+                        )
+                        year_evidence[end_yr] = year_evidence.get(end_yr, 0.0) + contrib
+                        year_support_refs.setdefault(end_yr, set()).add(entry.site_id)
+                        year_support_families.setdefault(end_yr, set()).add(family_name)
+
+                if not kept_any and len(top_idx) > 0:
+                    idx = top_idx[0]
+                    result = CorrelationResult(
+                        position=int(positions[idx]),
+                        correlation=float(corrs[idx]),
+                        t_value=float(t_vals[idx]),
+                        p_value=float(p_vals[idx]),
+                        overlap=int(overlaps[idx]),
+                        gleichlauf=float(glks[idx]),
+                    )
+                    raw_peaks.append((lane, entry, reference, result, float(t_z_arr[idx])))
+
+        if not raw_peaks:
+            return []
+
+        max_year_ev = max(year_evidence.values()) if year_evidence else 0.0
+
+        # Pass 2: Score peaks with multi-site year consensus and keep the best
+        # alignment per reference site.
+        best_per_ref: dict[str, tuple[float, SearchLane, ReferenceManifestEntry, np.ndarray, CorrelationResult, float, int, int, float]] = {}
+
+        for lane, entry, reference, result, tz in raw_peaks:
+            end_yr = int(result.position + n_sample - 1)
+
+            # Aggregate cluster support within +/- YEAR_CONSENSUS_WINDOW,
+            # weighting exact-year evidence highest.
+            cluster_refs: set[str] = set()
+            cluster_families: set[str] = set()
+            exact_ev = year_evidence.get(end_yr, 0.0)
+            neighbor_ev = 0.0
+            for delta in range(-YEAR_CONSENSUS_WINDOW, YEAR_CONSENSUS_WINDOW + 1):
+                yr_d = end_yr + delta
+                if yr_d in year_support_refs:
+                    cluster_refs.update(year_support_refs[yr_d])
+                    cluster_families.update(year_support_families[yr_d])
+                if delta != 0 and yr_d in year_evidence:
+                    neighbor_ev += year_evidence[yr_d] * (0.25 if abs(delta) == 1 else 0.1)
+
+            support = max(1, len(cluster_refs))
+            unique_families = max(1, len(cluster_families))
+            ev_ratio = ((exact_ev + neighbor_ev) / max_year_ev) if max_year_ev > 0.0 else 0.0
+
+            # Fast pre-score (without segment_correlation yet) to select best peak per reference.
+            base_fast = self._score_candidate(
+                result=result,
+                segment_consistency=0.0,
+                entry=entry,
+                species_filter=species_filter,
+                state_filter=state_filter,
+                sample_length=n_sample,
+                peak_z=tz,
+            ) - lane.lane_penalty
+
+            # Consensus bonus rewards multi-site agreement and normalized year-grid dominance.
+            cluster_bonus = self._compute_consensus_bonus(
+                support=support,
+                unique_families=unique_families,
+                ev_ratio=ev_ratio,
+                exact_ev=exact_ev,
+                max_year_ev=max_year_ev,
+            )
+            prelim_score = base_fast + cluster_bonus
+
+            # Keep the strongest peak per (reference, year_bucket) so a strong
+            # runner-up match at an alternate calendar year is not erased when
+            # the same reference also happens to peak near another cluster.
+            year_bucket = end_yr // (YEAR_CONSENSUS_WINDOW * 2 + 1)
+            ref_key = f"{entry.site_id}:{entry.filepath}:{year_bucket}"
+            prev = best_per_ref.get(ref_key)
+            if prev is None or prelim_score > prev[0]:
+                best_per_ref[ref_key] = (
+                    prelim_score,
+                    lane,
+                    entry,
+                    reference,
+                    result,
+                    tz,
+                    support,
+                    unique_families,
+                    cluster_bonus,
                 )
 
-                segment_consistency = self._segment_consistency(seg_corrs)
-                composite_score = self._score_candidate(
-                    result=best,
-                    segment_consistency=segment_consistency,
-                    entry=entry,
-                    species_filter=species_filter,
-                    state_filter=state_filter,
-                ) - lane.lane_penalty
-                rationale = self._candidate_rationale(best, segment_consistency, bark_edge, entry)
-                if lane.rationale:
-                    rationale.append(lane.rationale)
-
-                ranked.append(
-                    DatingCandidate(
-                        reference_id=entry.site_id,
-                        reference_name=entry.site_name,
-                        reference_species=entry.species,
-                        reference_material_group=entry.material_group or infer_material_group_from_species(entry.species),
-                        reference_state=entry.state,
-                        reference_file_type=entry.file_type,
-                        proposed_start_year=int(best.position),
-                        proposed_end_year=int(proposed_end),
-                        correlation=float(best.correlation),
-                        t_value=float(best.t_value),
-                        p_value=float(best.p_value),
-                        overlap=int(best.overlap),
-                        gleichlauf=float(best.gleichlauf),
-                        segment_correlations=seg_corrs,
-                        segment_consistency=float(segment_consistency),
-                        composite_score=float(max(0.0, composite_score)),
-                        search_lane=lane.name,
-                        search_lane_penalty=float(lane.lane_penalty),
-                        rationale=rationale,
-                    )
+        # Pass 3: Compute exact segment correlations (supporting partial overlaps)
+        # for the top candidate peaks and construct DatingCandidate objects.
+        top_prelim = sorted(best_per_ref.values(), key=lambda item: item[0], reverse=True)
+        eval_limit = max(top_n * 4, 50)
+        ranked: list[DatingCandidate] = []
+        for (
+            _prelim,
+            lane,
+            entry,
+            reference,
+            best,
+            tz,
+            support,
+            unique_families,
+            cluster_bonus,
+        ) in top_prelim[:eval_limit]:
+            proposed_end = int(best.position + n_sample - 1)
+            offset = int(best.position - entry.master_start_year)
+            aligned_sample, aligned_reference = self._aligned_slices(sample_std, reference, offset)
+            if aligned_sample is not None and aligned_reference is not None and len(aligned_sample) >= 20:
+                seg_len = min(50, max(20, len(aligned_sample) // 2))
+                seg_lag = max(10, min(25, len(aligned_sample) // 4))
+                seg_corrs = segment_correlation(
+                    aligned_sample,
+                    aligned_reference,
+                    segment_length=seg_len,
+                    lag=seg_lag,
                 )
+            else:
+                seg_corrs = []
 
-        self._apply_year_consensus_bonus(ranked)
+            segment_consistency = self._segment_consistency(seg_corrs)
+            base_score = self._score_candidate(
+                result=best,
+                segment_consistency=segment_consistency,
+                entry=entry,
+                species_filter=species_filter,
+                state_filter=state_filter,
+                sample_length=n_sample,
+                peak_z=tz,
+            ) - lane.lane_penalty
+
+            composite_score = max(0.0, base_score + cluster_bonus)
+            rationale = self._candidate_rationale(best, segment_consistency, bark_edge, entry)
+            if lane.rationale:
+                rationale.append(lane.rationale)
+            if unique_families >= 3:
+                rationale.append("multi-family year consensus")
+            elif support >= 2:
+                rationale.append("limited year consensus")
+            else:
+                rationale.append("isolated-year candidate")
+            if support >= 2:
+                rationale.append(f"year-consensus={support}")
+
+            ranked.append(
+                DatingCandidate(
+                    reference_id=entry.site_id,
+                    reference_name=entry.site_name,
+                    reference_species=entry.species,
+                    reference_material_group=entry.material_group or infer_material_group_from_species(entry.species),
+                    reference_state=entry.state,
+                    reference_file_type=entry.file_type,
+                    proposed_start_year=int(best.position),
+                    proposed_end_year=proposed_end,
+                    correlation=float(best.correlation),
+                    t_value=float(best.t_value),
+                    p_value=float(best.p_value),
+                    overlap=int(best.overlap),
+                    gleichlauf=float(best.gleichlauf),
+                    segment_correlations=seg_corrs,
+                    segment_consistency=float(segment_consistency),
+                    composite_score=float(composite_score),
+                    year_cluster_support=int(support),
+                    year_cluster_unique_families=int(unique_families),
+                    year_cluster_bonus=float(cluster_bonus),
+                    search_lane=lane.name,
+                    search_lane_penalty=float(lane.lane_penalty),
+                    rationale=rationale,
+                )
+            )
+
         ranked.sort(
             key=lambda candidate: (
                 candidate.composite_score,
@@ -733,13 +955,39 @@ class CrossdateMatcher:
             ),
             reverse=True,
         )
-        for index, candidate in enumerate(ranked):
-            next_score = ranked[index + 1].composite_score if index + 1 < len(ranked) else 0.0
-            candidate.score_gap_to_next = float(candidate.composite_score - next_score)
 
-        return ranked[:top_n]
+        # Compute score_gap_to_next against the strongest candidate from a
+        # DISTINCT calendar year (outside +/- YEAR_CONSENSUS_WINDOW) so that
+        # strong multi-site agreement on the same year does not penalize itself!
+        for candidate in ranked:
+            next_distinct_score = 0.0
+            for other in ranked:
+                if abs(other.outer_ring_year - candidate.outer_ring_year) > YEAR_CONSENSUS_WINDOW:
+                    next_distinct_score = other.composite_score
+                    break
+            candidate.score_gap_to_next = float(candidate.composite_score - next_distinct_score)
+
+        return ranked
+
+    def _compute_consensus_bonus(
+        self,
+        *,
+        support: int,
+        unique_families: int,
+        ev_ratio: float,
+        exact_ev: float,
+        max_year_ev: float,
+    ) -> float:
+        if support <= 1 and max_year_ev > 0.0:
+            # Isolated single-site peak: penalize slightly unless it IS the dominant evidence.
+            return 0.06 * ev_ratio - 0.04
+        family_bonus = min(0.18, max(0.0, 0.025 * (support - 1) + 0.02 * (unique_families - 1)))
+        exact_ratio = (exact_ev / max_year_ev) if max_year_ev > 0.0 else 0.0
+        evidence_bonus = 0.28 * min(1.0, ev_ratio) + 0.10 * min(1.0, exact_ratio)
+        return family_bonus + evidence_bonus
 
     def _apply_year_consensus_bonus(self, ranked: list[DatingCandidate]):
+        """Apply standalone year-consensus bonus to a pre-built candidate list."""
         if not ranked:
             return
 
@@ -788,6 +1036,23 @@ class CrossdateMatcher:
         ]
         return " ".join(tokens) or normalized
 
+    def _aligned_slices(
+        self,
+        sample: np.ndarray,
+        reference: np.ndarray,
+        offset: int,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return aligned overlapping slices of (sample, reference), supporting partial overlaps."""
+        n_sample = len(sample)
+        n_ref = len(reference)
+        s_start = max(0, -offset)
+        s_end = min(n_sample, n_ref - offset)
+        r_start = max(0, offset)
+        r_end = min(n_ref, offset + n_sample)
+        if s_end - s_start < 20:
+            return None, None
+        return sample[s_start:s_end], reference[r_start:r_end]
+
     def _aligned_reference(
         self,
         reference: np.ndarray,
@@ -801,7 +1066,7 @@ class CrossdateMatcher:
     def _segment_consistency(self, segment_results: list[tuple[int, float, float]]) -> float:
         if not segment_results:
             return 0.0
-        strong = sum(1 for _, _, t_val in segment_results if t_val >= 3.5)
+        strong = sum(1 for _, _, t_val in segment_results if t_val >= 3.0)
         return strong / len(segment_results)
 
     def _score_candidate(
@@ -812,13 +1077,26 @@ class CrossdateMatcher:
         entry: ReferenceManifestEntry,
         species_filter: Optional[list[str]],
         state_filter: Optional[list[str]],
+        sample_length: Optional[int] = None,
+        peak_z: float = 0.0,
     ) -> float:
         corr_score = max(0.0, min(result.correlation, 1.0))
-        t_score = max(0.0, min(result.t_value / 8.0, 1.0))
-        overlap_score = max(0.0, min(result.overlap / 100.0, 1.0))
+        t_val = result.t_value if np.isfinite(result.t_value) else 15.0
+        t_score = max(0.0, min(t_val / 8.0, 1.0))
+        abs_overlap_score = max(0.0, min(result.overlap / 100.0, 1.0))
+        if sample_length and sample_length > 0:
+            frac_overlap = max(0.0, min(result.overlap / float(sample_length), 1.0))
+            overlap_score = 0.45 * abs_overlap_score + 0.55 * (frac_overlap ** 0.75)
+            # Attenuate short edge-sliver correlations on long samples so a 30-year
+            # sliver cannot outrank a full-length match purely on inflated raw r.
+            edge_factor = 0.65 + 0.35 * (frac_overlap ** 0.5)
+        else:
+            overlap_score = abs_overlap_score
+            edge_factor = 1.0
         glk_score = max(0.0, min(result.gleichlauf / 100.0, 1.0))
-        meta_score = 1.0
+        prominence_score = max(0.0, min((peak_z - 2.0) / 6.0, 1.0))
 
+        meta_score = 1.0
         if not entry.species:
             meta_score -= 0.05
         if not entry.state:
@@ -829,12 +1107,13 @@ class CrossdateMatcher:
             meta_score += 0.02
 
         composite = (
-            corr_score * 0.34
-            + t_score * 0.28
+            corr_score * 0.24
+            + t_score * 0.32
             + overlap_score * 0.16
-            + glk_score * 0.10
+            + glk_score * 0.08
             + segment_consistency * 0.12
-        ) * max(0.0, meta_score)
+            + prominence_score * 0.08
+        ) * edge_factor * max(0.0, meta_score)
         return composite
 
     def _candidate_rationale(
@@ -877,17 +1156,78 @@ class CrossdateMatcher:
 
         return rationale
 
+    def _select_top_candidates(
+        self,
+        ranked: list[DatingCandidate],
+        *,
+        top_n: int,
+        is_recommended: bool,
+    ) -> list[DatingCandidate]:
+        """
+        Select top_n candidates in strict descending composite_score order.
+
+        For recommended dates, return the top-scoring distinct corroborating
+        references directly. For non-recommended (assisted-ranking) dates, keep
+        the strongest representative per +/-2-year cluster so runner-up
+        alternative calendar years remain visible in the top-N output, then
+        backfill any remaining slots.
+        """
+        if is_recommended:
+            unique_refs: list[DatingCandidate] = []
+            seen_refs: set[str] = set()
+            for candidate in ranked:
+                if candidate.reference_id in seen_refs:
+                    continue
+                seen_refs.add(candidate.reference_id)
+                unique_refs.append(candidate)
+                if len(unique_refs) >= top_n:
+                    break
+            return unique_refs
+
+        selected: list[DatingCandidate] = []
+        deferred: list[DatingCandidate] = []
+        cluster_counts: list[tuple[int, int]] = []  # (anchor_year, count)
+
+        for candidate in ranked:
+            matched_idx = None
+            for idx, (anchor_year, count) in enumerate(cluster_counts):
+                if abs(candidate.outer_ring_year - anchor_year) <= YEAR_CONSENSUS_WINDOW:
+                    matched_idx = idx
+                    break
+            if matched_idx is None:
+                cluster_counts.append((candidate.outer_ring_year, 1))
+                selected.append(candidate)
+            else:
+                deferred.append(candidate)
+            if len(selected) >= top_n:
+                break
+
+        if len(selected) < top_n and deferred:
+            selected.extend(deferred[: top_n - len(selected)])
+            selected.sort(
+                key=lambda candidate: (
+                    candidate.composite_score,
+                    candidate.year_cluster_bonus,
+                    candidate.year_cluster_support,
+                    candidate.t_value,
+                    candidate.correlation,
+                ),
+                reverse=True,
+            )
+
+        return selected[:top_n]
+
     def _is_recommended(self, candidate: DatingCandidate, *, recommendation_blocked: bool = False) -> bool:
         if recommendation_blocked:
             return False
         return bool(
             candidate.composite_score >= 0.62
-            and candidate.correlation >= 0.4
-            and candidate.t_value >= 5.5
+            and candidate.correlation >= 0.35
+            and candidate.t_value >= 5.0
             and candidate.overlap >= 50
             and candidate.segment_consistency >= 0.5
             and candidate.year_cluster_support >= 2
-            and candidate.score_gap_to_next >= 0.04
+            and candidate.score_gap_to_next >= 0.05
         )
 
     def _determine_status(self, candidates: list[DatingCandidate], warnings: list[str]) -> str:

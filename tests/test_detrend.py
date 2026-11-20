@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from dendro.crossdating.detrend import (
+    cook_peters_spline,
+    crossdate_transform,
     detrend_series,
     standardize,
     prewhiten,
@@ -198,3 +200,40 @@ class TestBuildChronology:
         assert not np.isnan(chron_biweight[0])
         # Mean would be ~4, biweight should be closer to 1 (downweighting outlier)
         assert chron_biweight[0] < chron_mean[0]
+
+
+class TestCookPetersAndCrossdateTransform:
+    """Tests for Cook & Peters spline frequency response, prewhiten NaN safety, and crossdate_transform."""
+
+    @pytest.mark.parametrize("period", [20.0, 32.0, 64.0])
+    def test_cook_peters_spline_50_percent_frequency_response(self, period):
+        t = np.arange(500, dtype=np.float64)
+        sig = np.sin(2.0 * np.pi * t / period)
+        fit = cook_peters_spline(sig, period=period)
+        ratio = np.std(fit[100:400]) / np.std(sig[100:400])
+        assert abs(ratio - 0.5) < 0.01
+
+    def test_prewhiten_preserves_mean_and_nans(self):
+        rng = np.random.default_rng(7)
+        n = 120
+        x = np.zeros(n)
+        for i in range(1, n):
+            x[i] = 0.7 * x[i - 1] + rng.normal(0.0, 0.2)
+        ratio_series = x + 1.0
+        ratio_series[50] = np.nan
+
+        residuals = prewhiten(ratio_series, order=1)
+        assert np.isnan(residuals[50])
+        assert not np.isnan(residuals[51])
+        assert abs(float(np.nanmean(residuals))) < 0.1
+
+    def test_crossdate_transform_handles_positive_and_zscore_series(self):
+        rng = np.random.default_rng(11)
+        raw_widths = np.exp(0.5 + rng.normal(0.0, 0.3, size=80))
+        z_series = rng.normal(0.0, 1.0, size=80)
+
+        t_raw = crossdate_transform(raw_widths)
+        t_z = crossdate_transform(z_series)
+        assert len(t_raw) == 80 and abs(float(np.nanmean(t_raw))) < 0.05
+        assert len(t_z) == 80 and abs(float(np.nanmean(t_z))) < 0.05
+

@@ -106,9 +106,9 @@ def detect_rings(
     # Calculate gradient (detect transitions)
     gradient = _calculate_gradient(profile)
 
-    # Find ring boundaries (peaks in gradient)
-    min_ring_px = int(min_ring_width_mm / mm_per_pixel)
-    max_ring_px = int(max_ring_width_mm / mm_per_pixel)
+    # Find ring boundaries (peaks in directional gradient)
+    min_ring_px = max(2, int(round(min_ring_width_mm / mm_per_pixel)))
+    max_ring_px = max(min_ring_px + 1, int(round(max_ring_width_mm / mm_per_pixel)))
 
     boundary_positions = _find_boundaries(
         gradient,
@@ -155,16 +155,30 @@ def detect_rings(
     )
 
 
+def _to_uint8(gray: np.ndarray) -> np.ndarray:
+    """Safely convert 8-bit, 16-bit, or floating-point grayscale arrays to uint8."""
+    if gray.dtype == np.uint8:
+        return gray
+    if gray.dtype == np.uint16:
+        return (gray >> 8).astype(np.uint8)
+    g = np.asarray(gray, dtype=np.float64)
+    g_min = float(np.nanmin(g))
+    g_max = float(np.nanmax(g))
+    if g_max <= g_min:
+        return np.zeros(g.shape, dtype=np.uint8)
+    scaled = (g - g_min) / (g_max - g_min) * 255.0
+    return np.clip(np.rint(scaled), 0, 255).astype(np.uint8)
+
+
 def _enhance_contrast(gray: np.ndarray) -> np.ndarray:
     """Apply contrast enhancement for better ring visibility."""
+    gray_u8 = _to_uint8(gray)
     if cv2 is None:
-        return gray
+        return gray_u8
 
     # CLAHE (Contrast Limited Adaptive Histogram Equalization)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray.astype(np.uint8))
-
-    return enhanced
+    return clahe.apply(gray_u8)
 
 
 def _sample_path(
@@ -232,30 +246,34 @@ def _sample_path(
 
 def _calculate_gradient(profile: np.ndarray) -> np.ndarray:
     """
-    Calculate gradient profile for ring detection.
+    Calculate a directional gradient profile for annual ring boundary detection.
 
-    Ring boundaries appear as transitions from light (earlywood)
-    to dark (latewood) or vice versa.
+    Annual ring boundaries are sharp transitions between dark latewood and
+    bright earlywood of one polarity (unlike ``abs(gradient)``, which
+    double-counts both sides of every latewood band). We choose the polarity
+    with sharper high-percentile transition peaks.
     """
-    # Smooth to reduce noise
-    kernel_size = max(3, len(profile) // 100)
+    if len(profile) < 3:
+        return np.zeros_like(profile, dtype=np.float64)
+
+    kernel_size = max(3, min(11, len(profile) // 100))
     if kernel_size % 2 == 0:
         kernel_size += 1
 
     smoothed = np.convolve(
         profile,
-        np.ones(kernel_size) / kernel_size,
-        mode='same'
+        np.ones(kernel_size, dtype=np.float64) / kernel_size,
+        mode="same",
     )
 
-    # Calculate gradient (first derivative)
-    gradient = np.gradient(smoothed)
+    grad = np.gradient(smoothed)
+    pos = np.maximum(grad, 0.0)
+    neg = np.maximum(-grad, 0.0)
 
-    # We want to detect transitions from light to dark (ring boundaries)
-    # Take absolute value to catch both directions
-    gradient = np.abs(gradient)
-
-    return gradient
+    # Sharp latewood-to-earlywood boundaries concentrate gradient energy in higher peaks.
+    if float(np.percentile(neg, 98)) > float(np.percentile(pos, 98)):
+        return neg
+    return pos
 
 
 def _find_boundaries(
@@ -265,40 +283,36 @@ def _find_boundaries(
     threshold: float,
 ) -> list[int]:
     """
-    Find ring boundary positions as peaks in gradient.
+    Find ring boundary positions as peaks in the directional gradient.
 
     Args:
-        gradient: Gradient profile.
+        gradient: Non-negative directional gradient profile.
         min_distance: Minimum pixels between boundaries.
-        max_distance: Maximum pixels between boundaries.
-        threshold: Detection threshold (0-1, fraction of max gradient).
+        max_distance: Maximum expected pixels between boundaries.
+        threshold: Detection sensitivity (0-1); higher = more sensitive.
 
     Returns:
         List of boundary positions (pixel indices).
     """
-    # Normalize gradient
-    grad_max = np.max(gradient)
-    if grad_max == 0:
+    from scipy.signal import find_peaks
+
+    grad_max = float(np.max(gradient)) if len(gradient) else 0.0
+    if grad_max <= 0.0:
         return []
 
     grad_norm = gradient / grad_max
+    # Higher sensitivity => lower peak height requirement.
+    sensitivity = float(np.clip(threshold, 0.05, 0.99))
+    height_cutoff = (1.0 - sensitivity) * 0.5 + 0.05
+    min_dist = max(2, int(min_distance))
 
-    # Find peaks above threshold
-    threshold_value = threshold * 0.5  # Scale threshold
-
-    # Simple peak finding
-    peaks = []
-    for i in range(min_distance, len(gradient) - min_distance):
-        # Check if this is a local maximum
-        window = gradient[max(0, i - min_distance // 2):
-                         min(len(gradient), i + min_distance // 2 + 1)]
-
-        if gradient[i] == np.max(window) and grad_norm[i] > threshold_value:
-            # Check distance from last peak
-            if not peaks or (i - peaks[-1]) >= min_distance:
-                peaks.append(i)
-
-    return peaks
+    peaks, _ = find_peaks(
+        grad_norm,
+        height=height_cutoff,
+        prominence=height_cutoff * 0.4,
+        distance=min_dist,
+    )
+    return [int(p) for p in peaks]
 
 
 def _boundary_confidence(gradient: np.ndarray, position: int) -> float:

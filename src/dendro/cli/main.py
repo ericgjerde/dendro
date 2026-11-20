@@ -204,7 +204,7 @@ def date(
     selected_material_group = normalize_material_group(material_group) if material_group else None
 
     try:
-        matcher = CrossdateMatcher(reference_dir=reference_dir, allow_remote_metadata=True)
+        matcher = CrossdateMatcher(reference_dir=reference_dir, allow_remote_metadata=False)
     except Exception as exc:
         click.echo(f"Error loading references: {exc}", err=True)
         raise SystemExit(1)
@@ -359,7 +359,7 @@ def infer_materials(
     built_year_range_value = _parse_built_year_range_or_exit(built_year_range)
 
     try:
-        matcher = CrossdateMatcher(reference_dir=reference_dir, allow_remote_metadata=True)
+        matcher = CrossdateMatcher(reference_dir=reference_dir, allow_remote_metadata=False)
     except Exception as exc:
         click.echo(f"Error loading references: {exc}", err=True)
         raise SystemExit(1)
@@ -574,7 +574,7 @@ def info(reference: Optional[str], json_output: bool):
         click.echo(f"Reference directory not found: {reference_dir}", err=True)
         raise SystemExit(1)
 
-    index = ChronologyIndex(reference_dir, allow_remote_metadata=True)
+    index = ChronologyIndex(reference_dir, allow_remote_metadata=False)
     payload = {
         "reference_dir": str(reference_dir),
         "entries": len(index),

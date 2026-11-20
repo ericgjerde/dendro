@@ -265,6 +265,7 @@ class MaterialInferenceEngine:
                 era_end=analysis_era_end,
                 min_overlap=min_overlap,
                 top_n=top_n,
+                allow_sparse_fallback=False,
             )
             dating_reports[material_group] = report
 

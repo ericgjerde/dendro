@@ -178,3 +178,64 @@ class TestDatingConfidence:
             gleichlauf=55,
         )
         assert dating_confidence(result) == "LOW"
+
+
+class TestVectorizedSlidingEquivalence:
+    """Verify vectorized sliding_correlation matches exact scipy pearsonr + naive GLK."""
+
+    def test_exact_equivalence_and_nan_handling(self):
+        from scipy import stats
+
+        rng = np.random.default_rng(123)
+        ref = rng.normal(0.0, 1.0, size=100)
+        sample = ref[25:65] + rng.normal(0.0, 0.15, size=40)
+        ref[40] = np.nan
+        sample[10] = np.nan
+
+        results = sliding_correlation(sample, ref, reference_start_year=1800, min_overlap=25)
+        by_pos = {r.position: r for r in results}
+        assert 1825 in by_pos
+
+        for pos in [1805, 1825, 1850]:
+            lag = pos - 1800
+            s0, s1 = max(0, -lag), min(len(sample), len(ref) - lag)
+            r0, r1 = max(0, lag), min(len(ref), lag + len(sample))
+            s_seg = sample[s0:s1]
+            r_seg = ref[r0:r1]
+            mask = ~(np.isnan(s_seg) | np.isnan(r_seg))
+            expected_r, expected_p = stats.pearsonr(s_seg[mask], r_seg[mask])
+            expected_glk = calculate_gleichlauf(s_seg[mask], r_seg[mask])
+            got = by_pos[pos]
+            assert got.overlap == int(np.sum(mask))
+            assert abs(got.correlation - expected_r) < 1e-10
+            assert abs(got.p_value - expected_p) < 1e-10
+            assert abs(got.gleichlauf - expected_glk) < 1e-10
+
+    def test_position_bounds_filter_cleanly(self):
+        rng = np.random.default_rng(9)
+        ref = rng.normal(0.0, 1.0, size=200)
+        sample = ref[120:170].copy()
+
+        bounded = find_best_match(
+            sample,
+            ref,
+            reference_start_year=1700,
+            min_overlap=30,
+            n_best=1,
+            min_position=1700,
+            max_position=1760,
+        )
+        assert len(bounded) == 1
+        assert 1700 <= bounded[0].position <= 1760
+
+    def test_constant_input_emits_no_warnings(self):
+        import warnings
+
+        ref = np.ones(100)
+        sample = np.linspace(0.0, 1.0, 40)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            results = sliding_correlation(sample, ref, reference_start_year=1800, min_overlap=30)
+        assert results == []
+        assert len(caught) == 0
+

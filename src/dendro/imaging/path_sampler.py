@@ -155,31 +155,38 @@ def profile_to_ring_positions(
 
     Args:
         profile: ProfileSample from sample_along_path.
-        sensitivity: Detection sensitivity (0-1).
+        sensitivity: Detection sensitivity (0-1). Higher = more boundaries.
         min_width_mm: Minimum ring width to detect.
 
     Returns:
         Tuple of (boundary_positions_mm, ring_widths_mm).
     """
-    # Calculate gradient
+    from scipy.signal import find_peaks
+
     smoothed = _smooth_profile(profile.intensities)
-    gradient = np.abs(np.gradient(smoothed))
+    grad = np.gradient(smoothed)
+    pos = np.maximum(grad, 0.0)
+    neg = np.maximum(-grad, 0.0)
+    gradient = neg if float(np.percentile(neg, 98)) > float(np.percentile(pos, 98)) else pos
 
-    # Find peaks
-    min_distance_px = int(min_width_mm / (25.4 / profile.dpi))
-    min_distance_px = max(3, min_distance_px)
+    grad_max = float(np.max(gradient)) if len(gradient) else 0.0
+    if grad_max <= 0.0:
+        return np.array([]), np.array([])
 
-    boundaries_px = _find_peaks(
+    min_distance_px = max(3, int(round(min_width_mm / (25.4 / profile.dpi))))
+    sens = float(np.clip(sensitivity, 0.05, 0.99))
+    height_cutoff = ((1.0 - sens) * 0.5 + 0.05) * grad_max
+
+    boundaries_px, _ = find_peaks(
         gradient,
-        min_distance=min_distance_px,
-        threshold=sensitivity * np.max(gradient) * 0.3,
+        height=height_cutoff,
+        prominence=height_cutoff * 0.4,
+        distance=min_distance_px,
     )
 
-    # Convert to mm
     mm_per_pixel = 25.4 / profile.dpi
-    boundaries_mm = np.array(boundaries_px) * mm_per_pixel
+    boundaries_mm = np.asarray(boundaries_px, dtype=np.float64) * mm_per_pixel
 
-    # Calculate widths
     if len(boundaries_mm) >= 2:
         widths_mm = np.diff(boundaries_mm)
     else:
@@ -258,13 +265,22 @@ def widths_to_tucson(
     Returns:
         Tucson format string.
     """
-    # Convert mm to 0.01mm units (standard Tucson)
-    widths_001mm = (widths_mm * 100).astype(int)
+    # Convert mm to 0.01mm units (standard Tucson, rounded rather than truncated).
+    # If any rounded measurement equals 999 (the 0.01mm stop marker), switch to
+    # 0.001mm precision with -9999 stop marker so the file round-trips losslessly.
+    widths_arr = np.asarray(widths_mm, dtype=np.float64)
+    widths_001mm = np.rint(widths_arr * 100.0).astype(int)
+    if np.any(widths_001mm == 999):
+        widths_int = np.rint(widths_arr * 1000.0).astype(int)
+        stop_marker_str = " -9999"
+    else:
+        widths_int = widths_001mm
+        stop_marker_str = "   999"
 
     if orientation == "bark_to_pith":
-        widths_001mm = widths_001mm[::-1]
+        widths_int = widths_int[::-1]
 
-    start_year = end_year - len(widths_001mm) + 1
+    start_year = end_year - len(widths_int) + 1
 
     # Format series ID
     series_id = series_id[:8].ljust(8)
@@ -276,23 +292,20 @@ def widths_to_tucson(
     year = start_year
     idx = 0
 
-    while idx < len(widths_001mm):
-        # Start of decade
-        decade_start = (year // 10) * 10
-
+    while idx < len(widths_int):
         # How many values fit in this decade
-        values_in_decade = min(10 - (year % 10), len(widths_001mm) - idx)
+        values_in_decade = min(10 - (year % 10), len(widths_int) - idx)
 
         # Build line
         line = f"{series_id}{year:4d}"
 
         for i in range(values_in_decade):
-            val = widths_001mm[idx + i]
+            val = widths_int[idx + i]
             line += f"{val:6d}"
 
         # Add stop marker at end
-        if idx + values_in_decade >= len(widths_001mm):
-            line += "   999"
+        if idx + values_in_decade >= len(widths_int):
+            line += stop_marker_str
 
         lines.append(line)
 

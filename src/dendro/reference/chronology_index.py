@@ -11,7 +11,14 @@ from typing import Optional
 
 import numpy as np
 
-from ..crossdating.detrend import DetrendMethod, build_chronology, detrend_series, standardize
+from ..crossdating.detrend import (
+    DetrendMethod,
+    build_chronology,
+    crossdate_transform,
+    detrend_series,
+    high_pass_filter,
+    standardize,
+)
 from ..materials.catalog import infer_material_group_from_species
 from .metadata import resolve_reference_metadata
 from .curated import CuratedChronology, parse_curated_chronology_file
@@ -38,10 +45,38 @@ class MasterChronology:
         return len(self.values)
 
     def values_array(self) -> np.ndarray:
-        return np.asarray(self.values, dtype=np.float64)
+        cached = getattr(self, "_cached_values", None)
+        if cached is None:
+            cached = np.asarray(
+                [np.nan if v is None else v for v in self.values],
+                dtype=np.float64,
+            )
+            self._cached_values = cached
+        return cached
+
+    def crossdate_values_array(self) -> np.ndarray:
+        """Return high-frequency prewhitened array cached for cross-dating."""
+        cached = getattr(self, "_cached_crossdate_values", None)
+        if cached is None:
+            raw = self.values_array()
+            if self.build_method == "rwl-log-hp20-ar1-biweight":
+                cached = raw
+            elif len(raw) >= 12 and int(np.sum(~np.isnan(raw))) >= 12:
+                try:
+                    cached = high_pass_filter(raw, spline_period=20.0, prewhiten_order=1)
+                except Exception:
+                    cached = raw
+            else:
+                cached = raw
+            self._cached_crossdate_values = cached
+        return cached
 
     def sample_depth_array(self) -> np.ndarray:
-        return np.asarray(self.sample_depth, dtype=np.int32)
+        cached = getattr(self, "_cached_depth", None)
+        if cached is None:
+            cached = np.asarray(self.sample_depth, dtype=np.int32)
+            self._cached_depth = cached
+        return cached
 
 
 @dataclass
@@ -81,6 +116,12 @@ class ReferenceManifestEntry:
         if self.master is None:
             return np.array([], dtype=np.float64)
         return self.master.values_array()
+
+    @property
+    def master_crossdate_values(self) -> np.ndarray:
+        if self.master is None:
+            return np.array([], dtype=np.float64)
+        return self.master.crossdate_values_array()
 
     @property
     def master_start_year(self) -> int:
@@ -144,10 +185,29 @@ class ChronologyIndex:
         return count
 
     def _manifest_stale(self, manifest_path: Path, data_dir: Path) -> bool:
+        disk_files = self._reference_files(data_dir)
+        if not disk_files:
+            # Offline committed-manifest mode (e.g. CI without raw RWL downloads).
+            return False
+
         manifest_mtime = manifest_path.stat().st_mtime
-        for filepath in self._reference_files(data_dir):
+        for filepath in disk_files:
             if filepath.stat().st_mtime > manifest_mtime:
                 return True
+
+        try:
+            raw = json.loads(manifest_path.read_text())
+            manifest_relpaths = {
+                str(Path(entry["filepath"]))
+                for entry in raw.get("entries", [])
+                if "filepath" in entry
+            }
+            disk_relpaths = {str(filepath.relative_to(data_dir)) for filepath in disk_files}
+            if manifest_relpaths != disk_relpaths:
+                return True
+        except Exception:
+            return True
+
         return False
 
     def _reference_files(self, data_dir: Path) -> list[Path]:
@@ -165,7 +225,8 @@ class ChronologyIndex:
         return sorted(files)
 
     def scan_directory(self, data_dir: str | Path, *, allow_remote_metadata: bool = False) -> int:
-        data_dir = Path(data_dir)
+        data_dir = Path(data_dir).resolve()
+        self.data_dir = data_dir
         self.entries = []
         self._by_species = {}
         self._by_state = {}
@@ -293,10 +354,11 @@ class ChronologyIndex:
             values = values / 1000.0
 
         standardized = standardize(values, method="zscore")
+        serialized = [None if np.isnan(val) else float(val) for val in standardized]
         return MasterChronology(
             start_year=chronology.start_year,
             end_year=chronology.end_year,
-            values=standardized.tolist(),
+            values=serialized,
             sample_depth=depth.tolist(),
             build_method="crn-index",
             detrend_method="none",
@@ -321,8 +383,10 @@ class ChronologyIndex:
                 if series.length < 10:
                     warnings.append(f"Skipped short series {series_id} ({series.length} rings).")
                     continue
-                detrended, _ = detrend_series(series.values, method=DetrendMethod.SPLINE)
-                standardized = standardize(detrended, method="zscore")
+                standardized = crossdate_transform(series.values, spline_period=20.0, prewhiten_order=1)
+                if int(np.sum(~np.isnan(standardized))) < 10:
+                    warnings.append(f"Skipped sparse series {series_id}.")
+                    continue
                 years = np.arange(series.start_year, series.end_year + 1)
                 series_list.append(standardized)
                 years_list.append(years)
@@ -342,16 +406,23 @@ class ChronologyIndex:
         if not np.any(valid):
             return start_year, end_year, num_years, num_series, None, warnings
 
-        master_years = master_years[valid]
-        master_values = master_values[valid]
-        sample_depth = sample_depth[valid]
+        # Trim leading/trailing NaNs only; preserve internal gaps so calendar years never shift.
+        first_valid = int(np.argmax(valid))
+        last_valid = len(valid) - 1 - int(np.argmax(valid[::-1]))
+        master_years = master_years[first_valid:last_valid + 1]
+        master_values = standardize(master_values[first_valid:last_valid + 1], method="zscore")
+        sample_depth = sample_depth[first_valid:last_valid + 1]
 
+        serialized_values = [
+            None if np.isnan(val) else float(val)
+            for val in master_values
+        ]
         master = MasterChronology(
             start_year=int(master_years[0]),
             end_year=int(master_years[-1]),
-            values=np.asarray(master_values, dtype=np.float64).tolist(),
+            values=serialized_values,
             sample_depth=np.asarray(sample_depth, dtype=np.int32).tolist(),
-            build_method="rwl-biweight-master",
+            build_method="rwl-log-hp20-ar1-biweight",
             detrend_method=DetrendMethod.SPLINE.value,
             standardized=True,
         )
@@ -506,12 +577,12 @@ class ChronologyIndex:
 
     def _entry_to_dict(self, entry: ReferenceManifestEntry) -> dict:
         payload = asdict(entry)
-        filepath = Path(entry.filepath)
+        filepath = Path(entry.filepath).resolve()
         if self.data_dir is not None:
             try:
-                payload["filepath"] = str(filepath.relative_to(self.data_dir))
+                payload["filepath"] = str(filepath.relative_to(self.data_dir.resolve()))
             except ValueError:
-                payload["filepath"] = str(filepath)
+                payload["filepath"] = str(entry.filepath)
         return payload
 
     def _entry_from_dict(self, raw_entry: dict) -> ReferenceManifestEntry:
@@ -522,6 +593,8 @@ class ChronologyIndex:
         filepath = Path(raw_entry["filepath"])
         if not filepath.is_absolute() and self.data_dir is not None:
             raw_entry["filepath"] = str(self.data_dir / filepath)
+        if not raw_entry.get("material_group") and raw_entry.get("species"):
+            raw_entry["material_group"] = infer_material_group_from_species(raw_entry["species"])
         return ReferenceManifestEntry(**raw_entry)
 
     def __len__(self) -> int:
