@@ -139,6 +139,18 @@ class ReferenceManifestEntry:
 # Backwards-compatible alias used by older tests/imports.
 ChronologyMetadata = ReferenceManifestEntry
 
+# Metadata fields a rebuild keeps from the previous manifest when the raw files
+# (and any local sidecars) cannot supply them.
+_CARRIED_METADATA_FIELDS = (
+    "species",
+    "state",
+    "latitude",
+    "longitude",
+    "elevation",
+    "provenance_url",
+    "study_metadata_url",
+)
+
 
 class ChronologyIndex:
     """
@@ -179,10 +191,61 @@ class ChronologyIndex:
                 self.save_manifest(manifest_path)
             return len(self.entries)
 
-        count = self.scan_directory(data_dir, allow_remote_metadata=allow_remote_metadata)
+        # A rebuild must not discard metadata the raw files cannot supply (species and
+        # site names fetched from NOAA earlier), or an offline rebuild silently strips it.
+        prior_metadata = self._read_prior_metadata(manifest_path, data_dir)
+        count = self.scan_directory(
+            data_dir,
+            allow_remote_metadata=allow_remote_metadata,
+            prior_metadata=prior_metadata,
+        )
         if manifest_path:
             self.save_manifest(manifest_path)
         return count
+
+    def _read_prior_metadata(self, manifest_path: Optional[Path], data_dir: Path) -> dict[str, dict]:
+        """Return the existing manifest's entries keyed by path relative to ``data_dir``."""
+        if manifest_path is None or not manifest_path.exists():
+            return {}
+        try:
+            raw_entries = json.loads(manifest_path.read_text()).get("entries", [])
+        except Exception:
+            return {}
+
+        prior: dict[str, dict] = {}
+        for raw_entry in raw_entries:
+            raw_path = raw_entry.get("filepath") if isinstance(raw_entry, dict) else None
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if path.is_absolute():
+                try:
+                    path = path.relative_to(data_dir)
+                except ValueError:
+                    continue
+            prior[str(path)] = raw_entry
+        return prior
+
+    def _carry_forward_metadata(self, entry: ReferenceManifestEntry, prior: Optional[dict]) -> None:
+        """Fill metadata this scan could not resolve from the previous manifest entry."""
+        if not prior or entry.file_type not in {"rwl", "crn"}:
+            return
+
+        carried = False
+        stem = Path(entry.filepath).stem
+        prior_site_name = prior.get("site_name")
+        if entry.site_name in ("", stem) and prior_site_name not in (None, "", stem):
+            entry.site_name = prior_site_name
+            carried = True
+        for name in _CARRIED_METADATA_FIELDS:
+            if getattr(entry, name) in (None, "") and prior.get(name) not in (None, ""):
+                setattr(entry, name, prior[name])
+                carried = True
+
+        if not entry.material_group:
+            entry.material_group = infer_material_group_from_species(entry.species)
+        if carried and prior.get("metadata_source"):
+            entry.metadata_source = prior["metadata_source"]
 
     def _manifest_stale(self, manifest_path: Path, data_dir: Path) -> bool:
         disk_files = self._reference_files(data_dir)
@@ -224,7 +287,13 @@ class ChronologyIndex:
                 files.append(filepath)
         return sorted(files)
 
-    def scan_directory(self, data_dir: str | Path, *, allow_remote_metadata: bool = False) -> int:
+    def scan_directory(
+        self,
+        data_dir: str | Path,
+        *,
+        allow_remote_metadata: bool = False,
+        prior_metadata: Optional[dict[str, dict]] = None,
+    ) -> int:
         data_dir = Path(data_dir).resolve()
         self.data_dir = data_dir
         self.entries = []
@@ -240,6 +309,8 @@ class ChronologyIndex:
             entry = self._index_file(filepath, allow_remote_metadata=allow_remote_metadata)
             if entry is None:
                 continue
+            if prior_metadata:
+                self._carry_forward_metadata(entry, prior_metadata.get(str(filepath.relative_to(data_dir))))
             self._add_entry(entry)
             count += 1
 

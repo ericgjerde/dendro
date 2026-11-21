@@ -187,6 +187,23 @@ class TestTucsonParserRegressions:
         assert series.values[10] == 1582.0
         assert series.values[11] == 1774.0
 
+    def test_mixed_precision_file_keeps_999_stop_marker_per_series(self, tmp_path: Path):
+        """A -9999 series elsewhere in the file must not turn another series' 999 stop marker into a ring."""
+        content = (
+            "AAA01   1960   158   177   999\n"
+            "BBB01   1960  1582  1774 -9999\n"
+        )
+        rwl_path = tmp_path / "mixed.rwl"
+        rwl_path.write_text(content)
+
+        rwl = parse_rwl_file(rwl_path)
+        coarse = rwl.series["AAA01"]
+        assert coarse.end_year == 1961
+        assert list(coarse.values) == [158.0, 177.0]
+        fine = rwl.series["BBB01"]
+        assert fine.end_year == 1961
+        assert list(fine.values) == [1582.0, 1774.0]
+
     def test_rwl_internal_gap_inserts_nans_without_shifting_years(self, tmp_path: Path):
         """A break between segments must produce NaNs rather than shifting later years."""
         content = (

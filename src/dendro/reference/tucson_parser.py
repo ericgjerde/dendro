@@ -124,7 +124,6 @@ def parse_rwl_file(filepath: str | Path) -> RWLFile:
 
     # Collect raw parsed lines per series first so we know each series' stop marker.
     raw_lines_by_series: dict[str, list[tuple[int, list[int]]]] = {}
-    file_uses_neg9999 = False
 
     for line in lines:
         line = line.rstrip("\n\r")
@@ -138,12 +137,12 @@ def parse_rwl_file(filepath: str | Path) -> RWLFile:
             continue
 
         series_id, year, values, _ = parsed
-        if -9999 in values:
-            file_uses_neg9999 = True
         raw_lines_by_series.setdefault(series_id, []).append((year, values))
 
     for series_id, records in raw_lines_by_series.items():
-        series_uses_neg9999 = file_uses_neg9999 or any(-9999 in vals for _, vals in records)
+        # The stop marker is a property of each series, not of the file: ITRDB
+        # files can mix 0.01 mm (999) and 0.001 mm (-9999) series.
+        series_uses_neg9999 = any(-9999 in vals for _, vals in records)
         stop_marker = -9999 if series_uses_neg9999 else 999
 
         year_to_value: dict[int, float] = {}

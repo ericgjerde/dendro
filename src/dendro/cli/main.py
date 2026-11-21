@@ -13,7 +13,7 @@ import click
 import numpy as np
 import pandas as pd
 
-from ..crossdating.matcher import CrossdateMatcher, DatingCandidate, DatingReport
+from ..crossdating.matcher import POLICY_VERSION, CrossdateMatcher, DatingCandidate, DatingReport
 from ..materials.catalog import material_group_display_name, material_group_species, normalize_material_group
 from ..materials.inference import MaterialInferenceContext, MaterialInferenceEngine, parse_built_year_range
 from ..reference.chronology_index import ChronologyIndex
@@ -730,7 +730,7 @@ def _build_inconclusive_date_report(
         chosen_orientation=chosen_orientation,
         analysis_orientation="oldest_to_newest",
         status="inconclusive",
-        policy_version="2026.04-assisted-ranking-v1",
+        policy_version=POLICY_VERSION,
         candidates=[],
         material_inference=material_inference,
         warnings=warnings,

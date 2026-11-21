@@ -73,7 +73,9 @@ def test_date_auto_material_embeds_material_inference(runner: CliRunner):
     assert result.exit_code == 0, result.output
 
     payload = json.loads(result.output)
-    assert payload["status"] == "recommended"
+    # A 79-ring sample whose best match is t = 6.8 stays below the recommendation
+    # gate (t >= 7.0); the correct year must still rank first.
+    assert payload["status"] == "ranked"
     assert payload["best_candidate"]["outer_ring_year"] == 1779
     assert payload["best_candidate"]["reference_material_group"] == "hemlock"
     assert payload["material_inference"] is not None

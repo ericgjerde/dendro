@@ -22,7 +22,18 @@ from .detrend import DetrendMethod, crossdate_transform, detrend_series, standar
 from ..reference.chronology_index import ChronologyIndex, ReferenceManifestEntry
 
 
-POLICY_VERSION = "2026.04-assisted-ranking-v1"
+POLICY_VERSION = "2026.11-assisted-ranking-v2"
+# Recommendation gate. The search compares a sample against every lag of every
+# reference (about 1e5 alignments by default), so the best chance alignment of
+# signal-free input reaches t of about 6. In leave-one-file-out runs over every
+# eligible reference series (2026-11), 1 of 1,481 dates recommended at t >= 7.0
+# was wrong; at t >= 5.0, 153 of 1,817 were wrong on series outside the tuning
+# benchmark. A reference that covers under half of the sample leaves most of it
+# uncompared, so such alignments stay ranked-only.
+RECOMMEND_MIN_T_VALUE = 7.0
+RECOMMEND_MIN_CORRELATION = 0.40
+RECOMMEND_MIN_OVERLAP = 50
+RECOMMEND_MIN_OVERLAP_FRACTION = 0.5
 YEAR_CONSENSUS_WINDOW = 2
 TOP_PEAKS_PER_REFERENCE = 8
 SPARSE_REFERENCE_WARNING_THRESHOLD = 8
@@ -1220,11 +1231,13 @@ class CrossdateMatcher:
     def _is_recommended(self, candidate: DatingCandidate, *, recommendation_blocked: bool = False) -> bool:
         if recommendation_blocked:
             return False
+        sample_length = candidate.proposed_end_year - candidate.proposed_start_year + 1
         return bool(
             candidate.composite_score >= 0.62
-            and candidate.correlation >= 0.35
-            and candidate.t_value >= 5.0
-            and candidate.overlap >= 50
+            and candidate.correlation >= RECOMMEND_MIN_CORRELATION
+            and candidate.t_value >= RECOMMEND_MIN_T_VALUE
+            and candidate.overlap >= RECOMMEND_MIN_OVERLAP
+            and candidate.overlap >= RECOMMEND_MIN_OVERLAP_FRACTION * sample_length
             and candidate.segment_consistency >= 0.5
             and candidate.year_cluster_support >= 2
             and candidate.score_gap_to_next >= 0.05

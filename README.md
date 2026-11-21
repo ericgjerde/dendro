@@ -240,7 +240,7 @@ See [docs/local-scan-validation.md](/Users/egjerde/code/dendrochronology/docs/lo
 ```json
 {
   "status": "recommended|ranked|inconclusive",
-  "policy_version": "2026.04-assisted-ranking-v1",
+  "policy_version": "2026.11-assisted-ranking-v2",
   "sample": {
     "name": "sample",
     "length": 80,
