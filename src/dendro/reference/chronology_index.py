@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +16,6 @@ from ..crossdating.detrend import (
     DetrendMethod,
     build_chronology,
     crossdate_transform,
-    detrend_series,
     high_pass_filter,
     standardize,
 )
@@ -26,6 +26,10 @@ from .tucson_parser import Chronology, RWLFile, parse_crn_file, parse_rwl_file
 
 
 MANIFEST_FILENAME = ".dendro-reference-manifest.json"
+# Bump when the parser or the master-chronology conditioning changes what a
+# manifest entry contains. A manifest with a different version is rebuilt from
+# the raw files when they are present.
+MANIFEST_FORMAT_VERSION = 2
 
 
 @dataclass
@@ -51,6 +55,9 @@ class MasterChronology:
                 [np.nan if v is None else v for v in self.values],
                 dtype=np.float64,
             )
+            # Cached and shared between callers: an in-place write would corrupt
+            # every later dating run, so hand out a read-only array.
+            cached.flags.writeable = False
             self._cached_values = cached
         return cached
 
@@ -68,6 +75,7 @@ class MasterChronology:
                     cached = raw
             else:
                 cached = raw
+            cached.flags.writeable = False
             self._cached_crossdate_values = cached
         return cached
 
@@ -75,6 +83,7 @@ class MasterChronology:
         cached = getattr(self, "_cached_depth", None)
         if cached is None:
             cached = np.asarray(self.sample_depth, dtype=np.int32)
+            cached.flags.writeable = False
             self._cached_depth = cached
         return cached
 
@@ -168,6 +177,8 @@ class ChronologyIndex:
         self._by_species: dict[str, list[ReferenceManifestEntry]] = {}
         self._by_state: dict[str, list[ReferenceManifestEntry]] = {}
         self._by_material_group: dict[str, list[ReferenceManifestEntry]] = {}
+        # Reference files that yielded no entry (for example a truncated download).
+        self._skipped_files: list[str] = []
         self.data_dir: Optional[Path] = Path(data_dir).resolve() if data_dir is not None else None
         self.manifest_name = manifest_name
 
@@ -260,11 +271,17 @@ class ChronologyIndex:
 
         try:
             raw = json.loads(manifest_path.read_text())
+            if raw.get("format_version") != MANIFEST_FORMAT_VERSION:
+                # Written by code with a different parser or conditioning.
+                return True
             manifest_relpaths = {
                 str(Path(entry["filepath"]))
                 for entry in raw.get("entries", [])
                 if "filepath" in entry
             }
+            # Files already known to yield no entry count as seen; without this an
+            # unparseable file would make the manifest stale on every load.
+            manifest_relpaths |= {str(Path(relpath)) for relpath in raw.get("skipped", [])}
             disk_relpaths = {str(filepath.relative_to(data_dir)) for filepath in disk_files}
             if manifest_relpaths != disk_relpaths:
                 return True
@@ -300,6 +317,7 @@ class ChronologyIndex:
         self._by_species = {}
         self._by_state = {}
         self._by_material_group = {}
+        self._skipped_files = []
 
         if not data_dir.exists():
             return 0
@@ -308,6 +326,7 @@ class ChronologyIndex:
         for filepath in self._reference_files(data_dir):
             entry = self._index_file(filepath, allow_remote_metadata=allow_remote_metadata)
             if entry is None:
+                self._skipped_files.append(str(filepath.relative_to(data_dir)))
                 continue
             if prior_metadata:
                 self._carry_forward_metadata(entry, prior_metadata.get(str(filepath.relative_to(data_dir))))
@@ -578,10 +597,22 @@ class ChronologyIndex:
 
     def save_manifest(self, filepath: str | Path):
         filepath = Path(filepath)
-        payload = {
+        payload: dict = {
+            "format_version": MANIFEST_FORMAT_VERSION,
             "entries": [self._entry_to_dict(entry) for entry in self.entries],
         }
-        filepath.write_text(json.dumps(payload, indent=2))
+        if self._skipped_files:
+            payload["skipped"] = sorted(self._skipped_files)
+
+        # Write to a sibling file and swap it in, so an interrupted or failed save
+        # never leaves a truncated manifest behind.
+        temp_path = filepath.with_name(filepath.name + ".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2))
+        try:
+            os.replace(temp_path, filepath)
+        except OSError:
+            temp_path.unlink(missing_ok=True)
+            raise
 
     def load_manifest(self, filepath: str | Path):
         filepath = Path(filepath)
@@ -590,6 +621,7 @@ class ChronologyIndex:
         self._by_species = {}
         self._by_state = {}
         self._by_material_group = {}
+        self._skipped_files = [str(relpath) for relpath in data.get("skipped", [])]
 
         for raw_entry in data.get("entries", []):
             entry = self._entry_from_dict(raw_entry)
@@ -648,8 +680,10 @@ class ChronologyIndex:
 
     def _entry_to_dict(self, entry: ReferenceManifestEntry) -> dict:
         payload = asdict(entry)
-        filepath = Path(entry.filepath).resolve()
         if self.data_dir is not None:
+            # Do not follow symlinks: a linked reference file belongs to the path it
+            # was found at, and resolving it would write a machine-specific path.
+            filepath = Path(os.path.abspath(entry.filepath))
             try:
                 payload["filepath"] = str(filepath.relative_to(self.data_dir.resolve()))
             except ValueError:
