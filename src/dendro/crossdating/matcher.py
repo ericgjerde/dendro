@@ -43,6 +43,32 @@ GENUS_FALLBACK_MIN_STATES = 2
 GENUS_FALLBACK_PENALTY = 0.025
 BROAD_FALLBACK_PENALTY = 0.04
 SUPPORTED_GENUS_FALLBACKS = {"PI", "QU"}
+# Stand-in for a non-finite t-value: r = +1 gives t = +inf (capped high), r = -1
+# gives t = -inf (capped low). A NaN t-value is never treated as evidence.
+NON_FINITE_T_CAP = 15.0
+
+
+def _finite_t(t_values):
+    """Map +inf to the cap and -inf (or NaN) to its negative; finite values pass through."""
+    return np.nan_to_num(t_values, nan=-NON_FINITE_T_CAP, posinf=NON_FINITE_T_CAP, neginf=-NON_FINITE_T_CAP)
+
+
+def condition_sample(values: np.ndarray, detrend_method: DetrendMethod = DetrendMethod.SPLINE) -> np.ndarray:
+    """Condition an oldest-to-newest sample exactly as ranking scores it."""
+    if detrend_method == DetrendMethod.SPLINE:
+        return crossdate_transform(values, spline_period=20.0, prewhiten_order=1)
+    detrended, _ = detrend_series(values, method=detrend_method)
+    return standardize(detrended, method="zscore")
+
+
+def scored_reference(
+    entry: ReferenceManifestEntry,
+    detrend_method: DetrendMethod = DetrendMethod.SPLINE,
+) -> np.ndarray:
+    """Return the reference series a conditioned sample is correlated against."""
+    if detrend_method == DetrendMethod.SPLINE:
+        return entry.master_crossdate_values
+    return entry.master_values
 
 
 @dataclass
@@ -265,6 +291,7 @@ class CrossdateMatcher:
         allow_sparse_fallback: bool = True,
     ) -> DatingReport:
         values = np.asarray(values, dtype=np.float64)
+        top_n = max(1, int(top_n))
         warnings: list[str] = []
         requested_species = [code.upper() for code in species_filter] if species_filter else None
         requested_states = [code.upper() for code in state_filter] if state_filter else None
@@ -318,21 +345,12 @@ class CrossdateMatcher:
                 },
             )
 
-        use_high_pass = detrend_method == DetrendMethod.SPLINE
         orientation_runs = self._resolve_orientations(values, orientation)
         best_run: Optional[tuple[str, list[DatingCandidate], np.ndarray]] = None
 
         for assumed_orientation, normalized_values in orientation_runs:
             try:
-                if use_high_pass:
-                    sample_std = crossdate_transform(
-                        normalized_values,
-                        spline_period=20.0,
-                        prewhiten_order=1,
-                    )
-                else:
-                    detrended, _ = detrend_series(normalized_values, method=detrend_method)
-                    sample_std = standardize(detrended, method="zscore")
+                sample_std = condition_sample(normalized_values, detrend_method)
             except Exception as exc:
                 warnings.append(f"Detrending failed for {assumed_orientation}: {exc}")
                 continue
@@ -347,7 +365,7 @@ class CrossdateMatcher:
                 top_n=top_n,
                 species_filter=requested_species,
                 state_filter=requested_states,
-                use_high_pass=use_high_pass,
+                detrend_method=detrend_method,
             )
 
             if best_run is None:
@@ -701,7 +719,7 @@ class CrossdateMatcher:
         top_n: int,
         species_filter: Optional[list[str]],
         state_filter: Optional[list[str]],
-        use_high_pass: bool = True,
+        detrend_method: DetrendMethod = DetrendMethod.SPLINE,
     ) -> list[DatingCandidate]:
         n_sample = len(sample_std)
         min_position = int(era_start) - n_sample + 1
@@ -733,7 +751,7 @@ class CrossdateMatcher:
                     continue
                 seen_ref_ids.add(ref_key)
 
-                reference = entry.master_crossdate_values if use_high_pass else entry.master_values
+                reference = scored_reference(entry, detrend_method)
                 if len(reference) < min_overlap:
                     continue
 
@@ -746,10 +764,16 @@ class CrossdateMatcher:
                     max_position=max_position,
                     compute_glk=True,
                 )
+                usable = ~np.isnan(t_vals)
+                if not usable.all():
+                    # An undefined statistic is not an alignment; it must never win a peak.
+                    positions, corrs, t_vals, p_vals, overlaps, glks = (
+                        arr[usable] for arr in (positions, corrs, t_vals, p_vals, overlaps, glks)
+                    )
                 if len(positions) == 0:
                     continue
 
-                t_finite = np.where(np.isfinite(t_vals), t_vals, 15.0)
+                t_finite = _finite_t(t_vals)
                 t_med = float(np.median(t_finite))
                 t_mad = float(np.median(np.abs(t_finite - t_med))) * 1.4826
                 t_z_arr = (t_finite - t_med) / max(t_mad, 0.5)
@@ -759,7 +783,6 @@ class CrossdateMatcher:
                 top_idx = top_idx[np.argsort(t_finite[top_idx])[::-1]]
 
                 family_name = self._normalize_reference_family(entry.site_name)
-                kept_any = False
                 for rank_i, idx in enumerate(top_idx):
                     tf = float(t_finite[idx])
                     rf = float(corrs[idx])
@@ -776,7 +799,6 @@ class CrossdateMatcher:
                     )
                     tz = float(t_z_arr[idx])
                     raw_peaks.append((lane, entry, reference, result, tz))
-                    kept_any = True
 
                     if tf > 2.0 and rf > 0.12:
                         end_yr = int(result.position + n_sample - 1)
@@ -791,18 +813,6 @@ class CrossdateMatcher:
                         year_evidence[end_yr] = year_evidence.get(end_yr, 0.0) + contrib
                         year_support_refs.setdefault(end_yr, set()).add(entry.site_id)
                         year_support_families.setdefault(end_yr, set()).add(family_name)
-
-                if not kept_any and len(top_idx) > 0:
-                    idx = top_idx[0]
-                    result = CorrelationResult(
-                        position=int(positions[idx]),
-                        correlation=float(corrs[idx]),
-                        t_value=float(t_vals[idx]),
-                        p_value=float(p_vals[idx]),
-                        overlap=int(overlaps[idx]),
-                        gleichlauf=float(glks[idx]),
-                    )
-                    raw_peaks.append((lane, entry, reference, result, float(t_z_arr[idx])))
 
         if not raw_peaks:
             return []
@@ -892,16 +902,20 @@ class CrossdateMatcher:
         ) in top_prelim[:eval_limit]:
             proposed_end = int(best.position + n_sample - 1)
             offset = int(best.position - entry.master_start_year)
-            aligned_sample, aligned_reference = self._aligned_slices(sample_std, reference, offset)
+            aligned_sample, aligned_reference, sample_offset = self._aligned_slices(sample_std, reference, offset)
             if aligned_sample is not None and aligned_reference is not None and len(aligned_sample) >= 20:
                 seg_len = min(50, max(20, len(aligned_sample) // 2))
                 seg_lag = max(10, min(25, len(aligned_sample) // 4))
-                seg_corrs = segment_correlation(
-                    aligned_sample,
-                    aligned_reference,
-                    segment_length=seg_len,
-                    lag=seg_lag,
-                )
+                # segment_correlation indexes the overlap slice; report sample ring indices.
+                seg_corrs = [
+                    (start + sample_offset, corr, t_val)
+                    for start, corr, t_val in segment_correlation(
+                        aligned_sample,
+                        aligned_reference,
+                        segment_length=seg_len,
+                        lag=seg_lag,
+                    )
+                ]
             else:
                 seg_corrs = []
 
@@ -997,47 +1011,6 @@ class CrossdateMatcher:
         evidence_bonus = 0.28 * min(1.0, ev_ratio) + 0.10 * min(1.0, exact_ratio)
         return family_bonus + evidence_bonus
 
-    def _apply_year_consensus_bonus(self, ranked: list[DatingCandidate]):
-        """Apply standalone year-consensus bonus to a pre-built candidate list."""
-        if not ranked:
-            return
-
-        family_cache = {
-            candidate.reference_id: self._normalize_reference_family(candidate.reference_name)
-            for candidate in ranked
-        }
-
-        for candidate in ranked:
-            cluster = [
-                other
-                for other in ranked
-                if abs(other.outer_ring_year - candidate.outer_ring_year) <= YEAR_CONSENSUS_WINDOW
-            ]
-            support = len(cluster)
-            unique_families = len({family_cache[other.reference_id] for other in cluster})
-            raw_score = candidate.composite_score
-            bonus = min(0.18, max(0.0, 0.03 * (support - 1) + 0.025 * (unique_families - 1)))
-            if support == 1:
-                bonus -= 0.03
-
-            candidate.year_cluster_support = support
-            candidate.year_cluster_unique_families = unique_families
-            candidate.year_cluster_bonus = bonus
-            candidate.composite_score = raw_score + bonus
-
-            if unique_families >= 3:
-                candidate.rationale.append("multi-family year consensus")
-            elif support >= 2:
-                candidate.rationale.append("limited year consensus")
-            else:
-                candidate.rationale.append("isolated-year candidate")
-            if support >= 2:
-                candidate.rationale.append(f"year-consensus={support}")
-
-    def _apply_year_consensus(self, candidates: list[DatingCandidate]):
-        # Backwards-compatible helper retained for older tests and callers.
-        self._apply_year_consensus_bonus(candidates)
-
     def _normalize_reference_family(self, reference_name: str) -> str:
         normalized = re.sub(r"[^a-z0-9]+", " ", reference_name.lower()).strip()
         tokens = [
@@ -1052,8 +1025,12 @@ class CrossdateMatcher:
         sample: np.ndarray,
         reference: np.ndarray,
         offset: int,
-    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Return aligned overlapping slices of (sample, reference), supporting partial overlaps."""
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
+        """
+        Return aligned overlapping slices of (sample, reference), supporting partial overlaps.
+
+        The third item is the sample index at which the overlap begins.
+        """
         n_sample = len(sample)
         n_ref = len(reference)
         s_start = max(0, -offset)
@@ -1061,18 +1038,8 @@ class CrossdateMatcher:
         r_start = max(0, offset)
         r_end = min(n_ref, offset + n_sample)
         if s_end - s_start < 20:
-            return None, None
-        return sample[s_start:s_end], reference[r_start:r_end]
-
-    def _aligned_reference(
-        self,
-        reference: np.ndarray,
-        offset: int,
-        sample_length: int,
-    ) -> Optional[np.ndarray]:
-        if offset < 0 or offset + sample_length > len(reference):
-            return None
-        return reference[offset:offset + sample_length]
+            return None, None, s_start
+        return sample[s_start:s_end], reference[r_start:r_end], s_start
 
     def _segment_consistency(self, segment_results: list[tuple[int, float, float]]) -> float:
         if not segment_results:
@@ -1092,7 +1059,7 @@ class CrossdateMatcher:
         peak_z: float = 0.0,
     ) -> float:
         corr_score = max(0.0, min(result.correlation, 1.0))
-        t_val = result.t_value if np.isfinite(result.t_value) else 15.0
+        t_val = float(_finite_t(result.t_value))
         t_score = max(0.0, min(t_val / 8.0, 1.0))
         abs_overlap_score = max(0.0, min(result.overlap / 100.0, 1.0))
         if sample_length and sample_length > 0:
@@ -1143,7 +1110,8 @@ class CrossdateMatcher:
         else:
             rationale.append("weak correlation")
 
-        if result.t_value >= 6.0:
+        # "high" is reserved for t-values that clear the recommendation gate.
+        if result.t_value >= RECOMMEND_MIN_T_VALUE:
             rationale.append("high t-value")
         elif result.t_value >= 4.0:
             rationale.append("useful but not secure t-value")

@@ -13,7 +13,14 @@ import click
 import numpy as np
 import pandas as pd
 
-from ..crossdating.matcher import POLICY_VERSION, CrossdateMatcher, DatingCandidate, DatingReport
+from ..crossdating.matcher import (
+    POLICY_VERSION,
+    CrossdateMatcher,
+    DatingCandidate,
+    DatingReport,
+    condition_sample,
+    scored_reference,
+)
 from ..materials.catalog import material_group_display_name, material_group_species, normalize_material_group
 from ..materials.inference import MaterialInferenceContext, MaterialInferenceEngine, parse_built_year_range
 from ..reference.chronology_index import ChronologyIndex
@@ -861,7 +868,7 @@ def _print_cross_verify(payload: dict):
 
 
 def _generate_plots(report: DatingReport, matcher: CrossdateMatcher, sample_values: np.ndarray, output_path: Path):
-    from ..crossdating.detrend import detrend_series, standardize
+    from ..crossdating.detrend import DetrendMethod
     from ..visualization.plots import save_diagnostic_plots
 
     best = report.best_candidate
@@ -875,13 +882,15 @@ def _generate_plots(report: DatingReport, matcher: CrossdateMatcher, sample_valu
     if report.chosen_orientation == "bark_to_pith":
         sample_values = sample_values[::-1]
 
-    detrended, _ = detrend_series(sample_values)
-    sample_std = standardize(detrended)
+    # Plot the conditioned sample and reference the matcher correlated, so the
+    # overlay agrees with the statistics reported beside it.
+    detrend_method = DetrendMethod(report.detrend_method)
+    sample_std = condition_sample(sample_values, detrend_method)
 
     save_diagnostic_plots(
         report=report,
         sample=sample_std,
-        reference=entry.master_values,
+        reference=scored_reference(entry, detrend_method),
         reference_start_year=entry.master_start_year,
         output_path=output_path,
     )

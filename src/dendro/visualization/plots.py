@@ -12,8 +12,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-from ..crossdating.matcher import CrossdateReport, MatchResult
+from ..crossdating.matcher import RECOMMEND_MIN_T_VALUE, CrossdateReport, MatchResult
 from ..crossdating.correlator import sliding_correlation, CorrelationResult
+
+
+# Segment quality classes as (minimum t, label, colour, fill pattern). Colours come
+# from the Okabe-Ito colourblind-safe palette and every class also has its own fill
+# pattern, so the plot never relies on telling red from green.
+SEGMENT_QUALITY_STYLES = (
+    (6.0, "Strong (t≥6)", "#0072B2", ""),
+    (4.0, "Good (t≥4)", "#56B4E9", "//"),
+    (3.5, "Marginal (t≥3.5)", "#E69F00", ".."),
+    (float("-inf"), "Weak (t<3.5)", "#D55E00", "xx"),
+)
+
+
+def _segment_quality_style(t_value: float) -> tuple[str, str, str]:
+    """Return (label, colour, fill pattern) for a segment t-value."""
+    for minimum_t, label, color, hatch in SEGMENT_QUALITY_STYLES:
+        if t_value >= minimum_t:
+            return label, color, hatch
+    return SEGMENT_QUALITY_STYLES[-1][1:]
 
 
 # Known marker years for New England region
@@ -144,12 +163,15 @@ def plot_correlation_profile(
     ax.plot(years, t_values, 'b-', linewidth=1)
 
     # Mark best position
-    ax.axvline(best_position, color='red', linewidth=2, linestyle='-', label=f'Best match: {best_position}')
+    ax.axvline(best_position, color='#D55E00', linewidth=2, linestyle='-', label=f'Best match: {best_position}')
 
-    # Add threshold lines
-    ax.axhline(6.0, color='green', linestyle='--', alpha=0.7, label='HIGH threshold (t=6)')
-    ax.axhline(4.0, color='orange', linestyle='--', alpha=0.7, label='MEDIUM threshold (t=4)')
-    ax.axhline(3.5, color='red', linestyle=':', alpha=0.5, label='Significance threshold (t=3.5)')
+    # Threshold lines: each has its own dash pattern as well as its own colour.
+    ax.axhline(
+        RECOMMEND_MIN_T_VALUE, color='#0072B2', linestyle='-', alpha=0.7,
+        label=f'Recommendation gate (t={RECOMMEND_MIN_T_VALUE:g})',
+    )
+    ax.axhline(4.0, color='#E69F00', linestyle='--', alpha=0.7, label='MEDIUM threshold (t=4)')
+    ax.axhline(3.5, color='#000000', linestyle=':', alpha=0.6, label='Significance threshold (t=3.5)')
 
     ax.set_xlabel("Sample Start Year")
     ax.set_ylabel("T-value")
@@ -192,41 +214,38 @@ def plot_segment_analysis(
     correlations = [seg[1] for seg in segment_correlations]
     t_values = [seg[2] for seg in segment_correlations]
 
-    # Color bars by quality
-    colors = []
-    for t in t_values:
-        if t >= 6.0:
-            colors.append('green')
-        elif t >= 4.0:
-            colors.append('orange')
-        elif t >= 3.5:
-            colors.append('yellow')
-        else:
-            colors.append('red')
+    # Mark each bar's quality class by colour and by fill pattern.
+    styles = [_segment_quality_style(t) for t in t_values]
 
     # Plot as bars
     width = (years[1] - years[0]) * 0.8 if len(years) > 1 else 20
-    bars = ax.bar(years, correlations, width=width, color=colors, alpha=0.7, edgecolor='black')
+    bars = ax.bar(
+        years, correlations, width=width,
+        color=[color for _, color, _ in styles], alpha=0.7, edgecolor='black',
+    )
+    for bar, (_, _, hatch) in zip(bars, styles):
+        bar.set_hatch(hatch)
 
     # Add threshold lines
-    ax.axhline(0.55, color='green', linestyle='--', alpha=0.7, label='HIGH (r=0.55)')
-    ax.axhline(0.45, color='orange', linestyle='--', alpha=0.7, label='MEDIUM (r=0.45)')
+    high_line = ax.axhline(0.55, color='#0072B2', linestyle='--', alpha=0.7, label='HIGH (r=0.55)')
+    medium_line = ax.axhline(0.45, color='#E69F00', linestyle=':', alpha=0.9, label='MEDIUM (r=0.45)')
     ax.axhline(0.0, color='black', linestyle='-', alpha=0.3)
 
     ax.set_xlabel("Segment Start Year")
     ax.set_ylabel("Correlation (r)")
     ax.set_title("Segment-by-Segment Correlation Analysis")
-    ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3, axis='y')
 
-    # Add custom legend for colors
+    # One legend for the quality classes (same colours and fill patterns as the
+    # bars) and the threshold lines, placed below the axes so it hides no bars.
     legend_elements = [
-        mpatches.Patch(facecolor='green', alpha=0.7, label='Strong (t≥6)'),
-        mpatches.Patch(facecolor='orange', alpha=0.7, label='Good (t≥4)'),
-        mpatches.Patch(facecolor='yellow', alpha=0.7, label='Marginal (t≥3.5)'),
-        mpatches.Patch(facecolor='red', alpha=0.7, label='Weak (t<3.5)'),
+        mpatches.Patch(facecolor=color, hatch=hatch, edgecolor='black', alpha=0.7, label=label)
+        for _, label, color, hatch in SEGMENT_QUALITY_STYLES
     ]
-    ax.legend(handles=legend_elements, loc='lower right', fontsize=8)
+    ax.legend(
+        handles=legend_elements + [high_line, medium_line],
+        loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=3, fontsize=8,
+    )
 
     return ax
 

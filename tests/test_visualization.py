@@ -105,3 +105,123 @@ class TestPlotFunctions:
         assert callable(plot_segment_analysis)
         assert callable(plot_sample_reference_overlay)
         assert callable(save_diagnostic_plots)
+
+
+class TestDiagnosticPlotInputs:
+    """`dendro date --plot` must draw the series the reported statistics came from."""
+
+    @pytest.mark.parametrize("reverse", [False, True], ids=["oldest_to_newest", "bark_to_pith"])
+    def test_generate_plots_passes_the_series_the_matcher_scored(self, monkeypatch, tmp_path, reverse):
+        import dendro.visualization.plots as plots
+        from dendro.cli.main import _generate_plots
+        from dendro.crossdating.matcher import CrossdateMatcher
+        from dendro.reference.chronology_index import ChronologyIndex, MasterChronology, ReferenceManifestEntry
+
+        rng = np.random.default_rng(11)
+        years = np.arange(200)
+        common = rng.normal(0.0, 0.15, size=200)
+        # A chronology index with slow swings: its raw values differ from the
+        # high-pass, prewhitened series the matcher correlates against.
+        reference = 1.0 + 0.4 * np.sin(2.0 * np.pi * years / 90.0) + common  # 1700..1899
+        age_trend = 2.0 * np.exp(-np.arange(100) / 60.0) + 0.5
+        widths = age_trend * np.exp(1.5 * common[60:160] + rng.normal(0.0, 0.05, size=100))  # 1760..1859
+
+        index = ChronologyIndex()
+        index._add_entry(
+            ReferenceManifestEntry(
+                filepath="/nonexistent/plotref.crn",
+                site_id="PLOTREF",
+                site_name="Plot Reference Site",
+                species="TSCA",
+                state="NH",
+                start_year=1700,
+                end_year=1899,
+                num_years=200,
+                num_series=12,
+                file_type="crn",
+                material_group="hemlock",
+                master=MasterChronology(
+                    start_year=1700,
+                    end_year=1899,
+                    values=reference.tolist(),
+                    sample_depth=[12] * 200,
+                    build_method="crn-index",
+                    detrend_method="spline",
+                ),
+            )
+        )
+        matcher = CrossdateMatcher(index=index)
+        measurements = widths[::-1] if reverse else widths
+
+        report = matcher.date_sample(
+            measurements,
+            sample_name="plot-sample",
+            orientation="auto",
+            era_start=1750,
+            era_end=1900,
+        )
+        best = report.best_candidate
+        assert best is not None
+        assert best.outer_ring_year == 1859
+        assert best.overlap == len(widths)
+        assert report.chosen_orientation == ("bark_to_pith" if reverse else "oldest_to_newest")
+
+        captured = {}
+
+        def capture_plot_inputs(**kwargs):
+            captured.update(kwargs)
+            return kwargs["output_path"]
+
+        monkeypatch.setattr(plots, "save_diagnostic_plots", capture_plot_inputs)
+        _generate_plots(report, matcher, measurements, tmp_path / "diagnostic.png")
+
+        assert captured["reference_start_year"] == 1700
+        offset = best.proposed_start_year - captured["reference_start_year"]
+        plotted_sample = np.asarray(captured["sample"])
+        plotted_reference = np.asarray(captured["reference"])[offset:offset + len(plotted_sample)]
+        plotted_r = float(np.corrcoef(plotted_sample, plotted_reference)[0, 1])
+        # The plotted pair reproduces the correlation printed next to it.
+        assert plotted_r == pytest.approx(best.correlation, abs=1e-9)
+
+
+class TestSegmentPlotIsReadableWithoutRedGreenVision:
+    """Segment quality must be encoded by pattern as well as colour."""
+
+    def _bars(self):
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import to_hex
+        from dendro.visualization.plots import plot_segment_analysis
+
+        fig, ax = plt.subplots()
+        try:
+            # One segment per quality class: strong, good, marginal, weak.
+            segments = [(0, 0.70, 7.0), (25, 0.55, 5.0), (50, 0.45, 3.7), (75, 0.10, 1.0)]
+            plot_segment_analysis(segments, sample_start_year=1700, ax=ax)
+            bars = [(patch.get_hatch(), to_hex(patch.get_facecolor())) for patch in ax.patches]
+            legend = ax.get_legend()
+            legend_entries = [
+                (handle.get_hatch(), text.get_text())
+                for handle, text in zip(legend.get_patches(), legend.get_texts())
+            ]
+        finally:
+            plt.close(fig)
+        return bars, legend_entries
+
+    def test_each_quality_class_has_its_own_fill_pattern(self):
+        bars, _ = self._bars()
+        hatches = [hatch for hatch, _ in bars]
+        assert len(bars) == 4
+        assert len(set(hatches)) == 4
+
+    def test_no_class_is_signalled_by_pure_red_or_green(self):
+        bars, _ = self._bars()
+        colors = {color for _, color in bars}
+        assert not colors & {"#008000", "#ff0000", "#00ff00"}
+
+    def test_legend_shows_the_same_patterns_as_the_bars(self):
+        bars, legend_entries = self._bars()
+        assert [hatch for hatch, _ in legend_entries] == [hatch for hatch, _ in bars]
+        assert [label.split()[0] for _, label in legend_entries] == ["Strong", "Good", "Marginal", "Weak"]
