@@ -47,8 +47,9 @@ def detrend_series(
     Args:
         values: Raw ring width values.
         method: Detrending method to use.
-        spline_period: For spline method, the wavelength (years) at which 50%
-            of variance is retained. If None, uses 2/3 of series length.
+        spline_period: For spline method, the wavelength (years) at which the
+            spline has a 50% amplitude (frequency) response. If None, uses
+            32 years, or 2/3 of the series length when that is shorter.
 
     Returns:
         Tuple of (detrended_values, fitted_curve).
@@ -390,13 +391,20 @@ def crossdate_transform(
     """
     COFECHA/ARSTAN-style cross-dating conditioning for ring-width series.
 
-    For positive ring-width measurements, applies a log transformation (stabilizing
-    multiplicative growth variance), removes low-frequency stand/age trends with a
-    Cook & Peters cubic smoothing spline, removes AR(p) biological persistence via
-    Yule-Walker prewhitening, and standardizes to zero mean and unit variance.
+    The branch is chosen from the values, not from what the series represents:
 
-    For already-standardized or non-positive series (e.g. z-scores or CRN indices),
-    applies the high-pass Cook & Peters spline and AR(p) prewhitening directly.
+    - No negative value and at least one positive value (raw ring widths, and
+      equally any all-positive index series such as ratio or CRN indices): takes
+      the natural log of the positive values (stabilizing multiplicative growth
+      variance), removes low-frequency stand/age trends with a Cook & Peters
+      cubic smoothing spline, removes AR(p) biological persistence via
+      Yule-Walker prewhitening, and standardizes to zero mean and unit variance.
+      Zero values are not floored: they are set to NaN (treated as missing)
+      before the log and stay NaN in the output.
+
+    - Any negative value (e.g. z-scores), or no positive value at all: the log
+      is skipped and the spline, AR(p) prewhitening and standardization are
+      applied to the values as given.
     """
     arr = np.asarray(values, dtype=np.float64)
     valid = ~np.isnan(arr)
@@ -405,7 +413,12 @@ def crossdate_transform(
 
     valid_vals = arr[valid]
     if float(np.min(valid_vals)) >= 0.0 and float(np.max(valid_vals)) > 0.0:
-        # Raw ring-width series (0 values treated as missing/very narrow positive floor).
+        # Non-negative series with at least one positive value: log-transform it.
+        # Zero-width rings are excluded by positive_mask and become NaN (missing);
+        # they are never replaced by a small positive value. The 1e-4 inside
+        # np.maximum only keeps np.log from seeing 0 at those masked positions;
+        # the one case where it alters an output is a positive value below 1e-4,
+        # which is raised to 1e-4 before the log.
         positive_mask = valid & (arr > 0)
         if int(np.sum(positive_mask)) < 10:
             raise ValueError("Not enough positive values for cross-dating transform")

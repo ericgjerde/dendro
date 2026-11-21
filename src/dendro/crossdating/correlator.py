@@ -32,6 +32,19 @@ class CorrelationResult:
     gleichlauf: float  # Gleichläufigkeit (sign agreement)
 
 
+# A window is treated as constant when its sum of squared deviations is below this
+# fraction of the whole series' sum of squared deviations.
+_REL_VARIANCE_TOL = 1e-12
+
+# segment_correlation centres each segment on its own mean, so a constant segment
+# leaves only rounding residue (about 1e-16 of the values). Same threshold scipy's
+# pearsonr uses for its near-constant warning.
+_REL_CONSTANT_NORM_TOL = 1e-13
+
+# Smallest positive normal float; below it products lose precision (subnormal) or are 0.
+_MIN_NORMAL = float(np.finfo(np.float64).tiny)
+
+
 def _compute_sliding_stats(
     sample: np.ndarray,
     reference: np.ndarray,
@@ -46,9 +59,24 @@ def _compute_sliding_stats(
 
     Returns arrays ``(positions, correlations, t_values, p_values, overlaps, glks)``
     filtered to valid lags with ``overlap >= min_overlap`` and non-constant inputs.
+
+    ``overlap`` is the number of years at that lag that are valid (not NaN) in both
+    series; r, t and p are computed on exactly those years. An overlap of fewer
+    than 3 years reports ``t = 0`` and ``p = 1``.
+
+    GLK is computed on year-to-year changes. A change is counted only when both
+    of its (calendar-consecutive) years are valid in both series, so its
+    denominator is the number of such year pairs: ``overlap - 1`` without NaNs,
+    fewer when gaps split the overlap. A lag with no countable change reports
+    GLK 0.0, the same value ``calculate_gleichlauf`` returns.
+
+    Raises:
+        ValueError: if ``min_overlap`` is less than 1.
     """
     sample = np.asarray(sample, dtype=np.float64)
     reference = np.asarray(reference, dtype=np.float64)
+    if min_overlap < 1:
+        raise ValueError(f"min_overlap must be at least 1, got {min_overlap}")
 
     n_sample = len(sample)
     n_reference = len(reference)
@@ -115,6 +143,9 @@ def _compute_sliding_stats(
 
         sum_xy_full = signal.correlate(r_centered, s_centered, mode="full", method="auto")
         sum_xy = sum_xy_full[full_idx]
+
+        ss_sample = float(cs_s2[-1])
+        ss_reference = float(cs_r2[-1])
     else:
         ms = (~np.isnan(sample)).astype(np.float64)
         mr = (~np.isnan(reference)).astype(np.float64)
@@ -135,6 +166,9 @@ def _compute_sliding_stats(
         sum_y2 = signal.correlate(r0 * r0, ms, mode="full", method="auto")[full_idx]
         sum_xy = signal.correlate(r0, s0, mode="full", method="auto")[full_idx]
 
+        ss_sample = float(np.dot(s0, s0))
+        ss_reference = float(np.dot(r0, r0))
+
     n_float = overlaps.astype(np.float64)
     # Guard division by zero for overlaps == 0 before masking.
     safe_n = np.where(overlaps > 0, n_float, 1.0)
@@ -142,29 +176,47 @@ def _compute_sliding_stats(
     var_y = sum_y2 - (sum_y * sum_y) / safe_n
     cov_xy = sum_xy - (sum_x * sum_y) / safe_n
 
-    # Scale-aware variance tolerance so truly constant segments are excluded cleanly.
-    var_tol = 1e-18
-    valid = (overlaps >= min_overlap) & (var_x > var_tol) & (var_y > var_tol)
+    # Relative variance tolerance. var_x / var_y are windowed sums of squares obtained
+    # by subtracting running sums, so a window that is constant in one series comes out
+    # as rounding noise (about 1e-16 of that series' total sum of squares) instead of
+    # exactly zero. Comparing against each series' own total sum of squares excludes
+    # those windows and is unaffected by the units the data is expressed in.
+    # The product must also be a normal float: at absurd scales (values near 1e-80 or
+    # 1e+80) it under- or overflows and r would be meaningless, so skip those lags.
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        var_product = var_x * var_y
+    valid = (
+        (overlaps >= min_overlap)
+        & (var_x > _REL_VARIANCE_TOL * ss_sample)
+        & (var_y > _REL_VARIANCE_TOL * ss_reference)
+        & (var_product >= _MIN_NORMAL)
+        & np.isfinite(var_product)
+    )
     if not np.any(valid):
         return empty
 
     lags_v = lags[valid]
     overlaps_v = overlaps[valid]
     n_v = overlaps_v.astype(np.float64)
-    denom = np.sqrt(var_x[valid] * var_y[valid])
+    denom = np.sqrt(var_product[valid])
     corrs = np.clip(cov_xy[valid] / denom, -1.0, 1.0)
 
     # Vectorized Student's t-value and two-sided p-value.
     one_minus_r2 = 1.0 - corrs * corrs
     t_vals = np.empty_like(corrs)
-    perfect_pos = corrs >= 1.0 - 1e-15
-    perfect_neg = corrs <= -1.0 + 1e-15
-    normal = ~(perfect_pos | perfect_neg)
+    # With fewer than 3 points there are no degrees of freedom: any two points lie on
+    # a line (r = +/-1), which is no evidence at all. Report t = 0 and p = 1.
+    too_few = overlaps_v < 3
+    perfect_pos = (corrs >= 1.0 - 1e-15) & ~too_few
+    perfect_neg = (corrs <= -1.0 + 1e-15) & ~too_few
+    normal = ~(perfect_pos | perfect_neg | too_few)
     t_vals[perfect_pos] = np.inf
     t_vals[perfect_neg] = -np.inf
+    t_vals[too_few] = 0.0
     t_vals[normal] = corrs[normal] * np.sqrt((n_v[normal] - 2.0) / one_minus_r2[normal])
 
     p_vals = np.zeros_like(corrs)
+    p_vals[too_few] = 1.0
     if np.any(normal):
         p_vals[normal] = 2.0 * stats.t.sf(np.abs(t_vals[normal]), df=n_v[normal] - 2.0)
 
@@ -177,17 +229,34 @@ def _compute_sliding_stats(
             m = np.maximum(n_v - 1.0, 1.0)
             glks = 50.0 * (1.0 + diff_corr_full[diff_idx] / m)
         else:
-            glks = np.empty_like(corrs)
-            for idx, lag in enumerate(lags_v):
-                lag_int = int(lag)
-                s0_i = max(0, -lag_int)
-                s1_i = min(n_sample, n_reference - lag_int)
-                r0_i = max(0, lag_int)
-                r1_i = min(n_reference, lag_int + n_sample)
-                s_seg = sample[s0_i:s1_i]
-                r_seg = reference[r0_i:r1_i]
-                vm = ~(np.isnan(s_seg) | np.isnan(r_seg))
-                glks[idx] = calculate_gleichlauf(s_seg[vm], r_seg[vm])
+            # A year-to-year change is counted only when both of its years are valid
+            # in both series; the change across a gap is not an annual change.
+            # pair_*[i] marks that years i and i+1 are both valid in that series.
+            s_ok = ~np.isnan(sample)
+            r_ok = ~np.isnan(reference)
+            pair_s = s_ok[:-1] & s_ok[1:]
+            pair_r = r_ok[:-1] & r_ok[1:]
+            d1 = np.where(pair_s, np.sign(np.diff(sample)), 0.0)
+            d2 = np.where(pair_r, np.sign(np.diff(reference)), 0.0)
+            diff_idx = lags_v + (n_sample - 2)
+            # Both sums are integers (products of -1/0/+1, and counts); rint removes
+            # FFT rounding so the result equals calculate_gleichlauf exactly.
+            sign_sum = np.rint(
+                signal.correlate(d2, d1, mode="full", method="auto")[diff_idx]
+            )
+            n_changes = np.rint(
+                signal.correlate(
+                    pair_r.astype(np.float64),
+                    pair_s.astype(np.float64),
+                    mode="full",
+                    method="auto",
+                )[diff_idx]
+            )
+            glks = np.where(
+                n_changes > 0,
+                50.0 * (1.0 + sign_sum / np.maximum(n_changes, 1.0)),
+                0.0,
+            )
     else:
         glks = np.zeros_like(corrs)
 
@@ -278,14 +347,20 @@ def calculate_gleichlauf(series1: np.ndarray, series2: np.ndarray) -> float:
     same direction (both increase or both decrease). It's a non-parametric
     measure that's robust to outliers.
 
-    Formula: GLK = 100 * (# agreements + 0.5 * # zeros) / (n - 1)
+    Formula: GLK = 100 * (# agreements + 0.5 * # zeros) / (# counted changes)
+
+    The two series are aligned year by year. A year-to-year change is counted
+    only when both of its years are present (not NaN) in both series, so the
+    change across a gap of missing years is not treated as an annual change.
+    Without NaNs the number of counted changes is n - 1.
 
     Args:
-        series1: First series.
-        series2: Second series.
+        series1: First series (may contain NaN for missing years).
+        series2: Second series, aligned to the first (may contain NaN).
 
     Returns:
-        Gleichläufigkeit as percentage (0-100).
+        Gleichläufigkeit as percentage (0-100). 0.0 if the series differ in
+        length, have fewer than 2 values, or share no countable change.
     """
     if len(series1) != len(series2) or len(series1) < 2:
         return 0.0
@@ -293,46 +368,14 @@ def calculate_gleichlauf(series1: np.ndarray, series2: np.ndarray) -> float:
     diff1 = np.diff(series1)
     diff2 = np.diff(series2)
 
-    sign1 = np.sign(diff1)
-    sign2 = np.sign(diff2)
+    counted = ~(np.isnan(diff1) | np.isnan(diff2))
+    if not np.any(counted):
+        return 0.0
 
-    n = len(diff1)
+    sign1 = np.sign(diff1[counted])
+    sign2 = np.sign(diff2[counted])
+
     return float(50.0 * (1.0 + np.mean(sign1 * sign2)))
-
-
-def cross_correlation(
-    sample: np.ndarray,
-    reference: np.ndarray,
-) -> np.ndarray:
-    """
-    Calculate normalized cross-correlation using FFT.
-
-    Args:
-        sample: Sample series.
-        reference: Reference series.
-
-    Returns:
-        Array of correlation coefficients at each lag.
-    """
-    sample = np.asarray(sample, dtype=np.float64)
-    reference = np.asarray(reference, dtype=np.float64)
-
-    s_std = float(np.nanstd(sample))
-    r_std = float(np.nanstd(reference))
-    if s_std == 0.0 or r_std == 0.0:
-        return np.zeros(len(reference) + len(sample) - 1, dtype=np.float64)
-
-    s_norm = np.nan_to_num((sample - float(np.nanmean(sample))) / s_std)
-    r_norm = np.nan_to_num((reference - float(np.nanmean(reference))) / r_std)
-
-    xcorr = signal.correlate(r_norm, s_norm, mode="full", method="auto")
-    overlap = signal.correlate(
-        np.ones(len(reference), dtype=np.float64),
-        np.ones(len(sample), dtype=np.float64),
-        mode="full",
-        method="auto",
-    )
-    return xcorr / np.maximum(overlap, 1.0)
 
 
 def segment_correlation(
@@ -379,9 +422,17 @@ def segment_correlation(
         r_v = seg_ref[valid]
         s_c = s_v - np.mean(s_v)
         r_c = r_v - np.mean(r_v)
-        denom = float(np.sqrt(np.dot(s_c, s_c) * np.dot(r_c, r_c)))
-        if denom <= 1e-18:
+        ss_s = float(np.dot(s_c, s_c))
+        ss_r = float(np.dot(r_c, r_c))
+        # Skip segments that are constant in either series, judged relative to the
+        # size of the values so the test does not depend on the data's units.
+        tol2 = _REL_CONSTANT_NORM_TOL * _REL_CONSTANT_NORM_TOL
+        if ss_s <= tol2 * float(np.dot(s_v, s_v)) or ss_r <= tol2 * float(np.dot(r_v, r_v)):
             continue
+        ss_product = ss_s * ss_r
+        if not (_MIN_NORMAL <= ss_product < np.inf):
+            continue
+        denom = float(np.sqrt(ss_product))
 
         r = float(np.clip(np.dot(s_c, r_c) / denom, -1.0, 1.0))
         t = calculate_tvalue(r, n_valid)
@@ -415,6 +466,7 @@ def find_best_match(
 
     Returns:
         List of top N correlation results, sorted by t-value descending.
+        Positions with exactly equal t-values are returned earliest first.
     """
     positions, corrs, t_vals, p_vals, overlaps, glks = _compute_sliding_stats(
         sample=sample,
@@ -428,7 +480,8 @@ def find_best_match(
     if len(positions) == 0 or n_best <= 0:
         return []
 
-    order = np.argsort(t_vals)[::-1]
+    # Descending t; exact ties keep position order (earliest first).
+    order = np.argsort(-t_vals, kind="stable")
     selected: list[CorrelationResult] = []
     for idx in order:
         pos = int(positions[idx])
