@@ -9,8 +9,9 @@ Data Bank (ITRDB). This module handles both:
 Format specification:
 - RWL: cols 1-8 series ID, cols 9-12 start year, then 6-char integer values.
   Stop marker is either 999 (0.01 mm precision) or -9999 (0.001 mm precision).
-- CRN: cols 1-6 (standard ITRDB) or 1-8 site ID, next 4 cols decade year,
-  then ten 7-char (4-char value + 3-char sample depth) pairs; 9990 = missing.
+- CRN: cols 1-6 (standard ITRDB) or 1-8 site ID, next 4 cols decade year
+  (the first line may carry the true first year instead), then ten 7-char
+  (4-char value + 3-char sample depth) pairs; 9990 = missing.
 """
 
 from __future__ import annotations
@@ -123,7 +124,7 @@ def parse_rwl_file(filepath: str | Path) -> RWLFile:
     rwl.metadata["filename"] = filepath.name
 
     # Collect raw parsed lines per series first so we know each series' stop marker.
-    raw_lines_by_series: dict[str, list[tuple[int, list[int]]]] = {}
+    raw_lines_by_series: dict[str, list[tuple[int, list[Optional[int]]]]] = {}
 
     for line in lines:
         line = line.rstrip("\n\r")
@@ -148,6 +149,9 @@ def parse_rwl_file(filepath: str | Path) -> RWLFile:
         year_to_value: dict[int, float] = {}
         for line_year, vals in records:
             for offset, v in enumerate(vals):
+                # Blank or unreadable field: the year stays a gap (NaN).
+                if v is None:
+                    continue
                 if v == stop_marker or v == -9999:
                     break
                 # Standard Tucson missing-value sentinels inside active series
@@ -175,7 +179,7 @@ def parse_rwl_file(filepath: str | Path) -> RWLFile:
     return rwl
 
 
-def _parse_rwl_line(line: str) -> tuple[str, int, list[int], bool] | None:
+def _parse_rwl_line(line: str) -> tuple[str, int, list[Optional[int]], bool] | None:
     """
     Parse a single line of an RWL file.
 
@@ -184,6 +188,10 @@ def _parse_rwl_line(line: str) -> tuple[str, int, list[int], bool] | None:
     - Cols 9-12: Year (right-justified)
     - Cols 13-18, 19-24, etc.: Ring width values (6 chars each, right-justified)
 
+    Values are returned by fixed-width slot position: ``values[i]`` belongs to
+    ``year + i``. A blank or non-numeric field followed by later values is
+    returned as ``None`` so it leaves a gap instead of shifting later years.
+
     Returns:
         Tuple of (series_id, year, values, is_end_marker) or None if unparseable
     """
@@ -191,41 +199,37 @@ def _parse_rwl_line(line: str) -> tuple[str, int, list[int], bool] | None:
         return None
 
     series_id = line[:8].strip()
+    year_str = line[8:12].strip()
+    # A 5-character negative year ("ABC01  -1005") borrows column 8 from the
+    # ID field. Only accepted when a space separates the ID from the sign.
+    if line[6:8] == " -" and line[8:12].isdigit():
+        series_id = line[:7].strip()
+        year_str = "-" + line[8:12]
     if not series_id:
         return None
 
     try:
-        year_str = line[8:12].strip()
         year = int(year_str)
     except (ValueError, IndexError):
         return None
 
-    values: list[int] = []
-    pos = 12
+    values: list[Optional[int]] = []
     is_end = False
 
-    while pos + 6 <= len(line):
+    for pos in range(12, len(line), 6):
         val_str = line[pos:pos + 6].strip()
+        val: Optional[int] = None
         if val_str:
             try:
                 val = int(val_str)
-                values.append(val)
-                if val == 999 or val == -9999:
-                    is_end = True
             except ValueError:
-                pass
-        pos += 6
+                val = None
+        if val == 999 or val == -9999:
+            is_end = True
+        values.append(val)
 
-    if pos < len(line):
-        val_str = line[pos:].strip()
-        if val_str:
-            try:
-                val = int(val_str)
-                values.append(val)
-                if val == 999 or val == -9999:
-                    is_end = True
-            except ValueError:
-                pass
+    while values and values[-1] is None:
+        values.pop()
 
     if not values:
         return None
@@ -233,39 +237,129 @@ def _parse_rwl_line(line: str) -> tuple[str, int, list[int], bool] | None:
     return series_id, year, values, is_end
 
 
-def _detect_crn_layout(line: str) -> Optional[tuple[int, int]]:
+# CRN integers are written right-justified in their fixed-width fields.
+_CRN_INT_FIELD = re.compile(r" *-?\d+")
+_CRN_MISSING_VALUES = {9990, -999}
+
+# One CRN slot: (index value, sample depth), or None for padding/missing.
+_CRNSlot = Optional[tuple[int, int]]
+
+
+def _parse_crn_data_line(line: str, id_width: int) -> Optional[tuple[str, int, list[_CRNSlot], bool]]:
     """
-    Detect CRN fixed-column layout on a candidate data line.
+    Split a CRN line under a fixed-column layout (``id_width`` is 6 or 8).
+
+    Returns ``(line_id, year, slots, clean)`` or None when the line is not a
+    data line under this layout (header, statistics trailer, comment, text).
+    ``slots[i]`` is the i-th 7-char value/depth pair, None when it is padding
+    or missing. ``clean`` is True when every pair is a right-justified integer
+    pair and the line ends on a pair boundary, which is how a line read under
+    the correct layout looks.
+    """
+    data_start = id_width + 4
+    if line.startswith("#") or len(line) < data_start + 7:
+        return None
+
+    line_id = line[:id_width].strip()
+    year_field = line[id_width:data_start]
+    # The three header lines carry " 1 ", " 2 ", " 3 " after the ID, which is
+    # never a right-justified integer, so they are rejected here without a
+    # year-range rule that would also drop early-year data lines.
+    if not line_id or not _CRN_INT_FIELD.fullmatch(year_field):
+        return None
+    if "." in line[data_start:]:
+        return None
+
+    # Standard CRN has up to 10 value/depth pairs per line (7 chars each).
+    body = line[data_start:data_start + 70]
+    clean = len(line.rstrip()) <= data_start + 70 and len(body.rstrip()) % 7 == 0
+    slots: list[_CRNSlot] = []
+    numeric_pairs = 0
+    for pos in range(0, len(body) - 6, 7):
+        val_field = body[pos:pos + 4]
+        depth_field = body[pos + 4:pos + 7]
+        if not _CRN_INT_FIELD.fullmatch(val_field) or (
+            depth_field.strip() and not _CRN_INT_FIELD.fullmatch(depth_field)
+        ):
+            clean = False
+        try:
+            val = int(val_field.strip())
+            depth = int(depth_field.strip()) if depth_field.strip() else 1
+        except ValueError:
+            # Blank or unreadable pair: keep the slot so later years do not shift.
+            slots.append(None)
+            continue
+        numeric_pairs += 1
+        if val in _CRN_MISSING_VALUES or depth <= 0:
+            slots.append(None)
+        else:
+            slots.append((val, depth))
+
+    if not numeric_pairs:
+        return None
+
+    return line_id, int(year_field), slots, clean
+
+
+def _score_crn_layout(lines: list[str], id_width: int) -> Optional[tuple[int, int, int]]:
+    """
+    Score how well a fixed-column layout explains the data lines of a file.
+
+    Returns ``(decade_steps, clean_lines, data_lines)``: the number of
+    consecutive data lines whose year advances to the next decade, the number
+    of lines that parse cleanly, and the number of data lines. None when no
+    line parses as data under this layout.
+    """
+    parsed = [p for p in (_parse_crn_data_line(line, id_width) for line in lines) if p is not None]
+    if not parsed:
+        return None
+    first_id = parsed[0][0]
+    parsed = [p for p in parsed if p[0] == first_id]
+    decade_steps = sum(
+        1
+        for prev, nxt in zip(parsed, parsed[1:])
+        if nxt[1] == prev[1] - prev[1] % 10 + 10
+    )
+    clean_lines = sum(1 for p in parsed if p[3])
+    return decade_steps, clean_lines, len(parsed)
+
+
+def _detect_crn_layout(lines: list[str]) -> Optional[tuple[int, int]]:
+    """
+    Detect the CRN fixed-column layout from all data lines of a file.
 
     Returns ``(id_width, data_start)`` where standard ITRDB CRN uses
     ``(6, 10)`` (6-char ID, 4-char year, 7-char value/depth pairs) and
     extended 8-char ID variants use ``(8, 12)``.
+
+    A single line cannot settle this: an 8-char ID ending in digits also reads
+    as a 6-char ID followed by a year. The layout whose years advance one
+    decade per line, and whose value/depth pairs are well formed, wins; the
+    standard 6-char layout wins ties.
     """
-    if len(line) < 17 or line.startswith("#"):
-        return None
-
+    best: Optional[tuple[tuple[int, int, int], int]] = None
     for id_width in (6, 8):
-        year_slice = line[id_width:id_width + 4].strip()
-        if not year_slice or not re.fullmatch(r"-?\d{3,4}", year_slice):
-            continue
-        data_start = id_width + 4
-        if len(line) < data_start + 7:
-            continue
-        # Verify at least the first 7-char pair parses as two integers (val + depth).
-        first_val = line[data_start:data_start + 4].strip()
-        first_depth = line[data_start + 4:data_start + 7].strip()
-        try:
-            int(first_val)
-            if first_depth:
-                int(first_depth)
-        except ValueError:
-            continue
-        # Extra check for standard 6-char layout: reject header lines like "PORSTD 1 ..."
-        id_part = line[:id_width].strip()
-        if not id_part:
-            continue
-        return (id_width, data_start)
+        score = _score_crn_layout(lines, id_width)
+        if score is not None and (best is None or score > best[0]):
+            best = (score, id_width)
+    if best is None:
+        return None
+    return best[1], best[1] + 4
 
+
+def _crn_header_site_id(lines: list[str], id_width: int) -> Optional[str]:
+    """
+    Site ID from the Tucson header lines that precede the data.
+
+    Header lines are ``<6-char ID> 1 ...``, ``<ID> 2 ...``, ``<ID> 3 ...``.
+    Data lines of ARSTAN-written files carry the chronology type instead
+    (``STNDRD``, ``RESID``, ``ARSTAN``), so the header is the site-specific ID.
+    """
+    for line in lines:
+        if _parse_crn_data_line(line, id_width) is not None:
+            break
+        if line[6:9] in {" 1 ", " 2 ", " 3 "} and line[:6].strip():
+            return line[:6].strip()
     return None
 
 
@@ -286,72 +380,40 @@ def parse_crn_file(filepath: str | Path) -> Chronology | None:
 
     year_to_val: dict[int, float] = {}
     year_to_depth: dict[int, int] = {}
-    site_id: Optional[str] = None
-    detected_layout: Optional[tuple[int, int]] = None
+    data_line_id: Optional[str] = None
+
+    layout = _detect_crn_layout(lines)
+    if layout is None:
+        return None
+    id_width, _ = layout
 
     for line in lines:
-        if not line or line.startswith("#"):
-            continue
-        # Skip standard 3-line Tucson headers (e.g. "PORSTD 1 ...", "PORSTD 2 ...", "PORSTD 3 ...")
-        if len(line) >= 8 and line[6:8] in {" 1", " 2", " 3"} and not line[8:12].strip().isdigit():
+        parsed = _parse_crn_data_line(line, id_width)
+        if parsed is None:
             continue
 
-        layout = detected_layout or _detect_crn_layout(line)
-        if layout is None:
+        line_id, line_year, slots, _ = parsed
+        if data_line_id is None:
+            data_line_id = line_id
+        elif line_id != data_line_id:
             continue
 
-        id_width, data_start = layout
-        if len(line) < data_start + 7:
-            continue
-        if "." in line[data_start:]:
-            continue
-        line_site_id = line[:id_width].strip()
-        if not line_site_id:
-            continue
-        if site_id is not None and line_site_id != site_id:
-            continue
+        # Slot 0 normally holds the year in the year field. A first line that
+        # starts mid-decade comes in two forms:
+        #   - the year field is the true first year but the slots stay
+        #     decade-aligned, with 9990 padding before it (1641 -> slot 1);
+        #   - the values simply start at slot 0 (RWL style).
+        # Leading padding up to the year's position in its decade identifies
+        # the first form. Python's floor modulo keeps negative years right.
+        offset = line_year % 10
+        if offset and all(cell is None for cell in slots[:offset]):
+            line_year -= offset
 
-        try:
-            decade_year = int(line[id_width:data_start].strip())
-        except ValueError:
-            continue
-
-        if detected_layout is None:
-            detected_layout = layout
-        if site_id is None:
-            site_id = line_site_id
-
-        pos = data_start
-        slot = 0
-        # Standard CRN has up to 10 value/depth pairs per line (7 chars each).
-        while pos + 7 <= len(line) and slot < 10:
-            val_str = line[pos:pos + 4].strip()
-            depth_str = line[pos + 4:pos + 7].strip()
-            pos += 7
-
-            if not val_str or val_str in {"9990", "-999", "-9999"}:
-                slot += 1
+        for slot, cell in enumerate(slots):
+            if cell is None:
                 continue
-
-            try:
-                val = int(val_str)
-                depth = int(depth_str) if depth_str else 1
-            except ValueError:
-                slot += 1
-                continue
-
-            if val == 9990 or val == -999 or depth <= 0:
-                slot += 1
-                continue
-
-            # On a first-decade line starting mid-decade (e.g. year=1703),
-            # some files put year=1703 with values starting at slot 0, while
-            # standard ITRDB puts year=1700 with 9990 padding in slots 0..2.
-            # Using decade_year + slot handles both cleanly!
-            yr = decade_year + slot
-            year_to_val[yr] = float(val)
-            year_to_depth[yr] = depth
-            slot += 1
+            year_to_val[line_year + slot] = float(cell[0])
+            year_to_depth[line_year + slot] = cell[1]
 
     if not year_to_val:
         return None
@@ -367,7 +429,7 @@ def parse_crn_file(filepath: str | Path) -> Chronology | None:
         depth_arr[idx] = year_to_depth[yr]
 
     return Chronology(
-        site_id=site_id or filepath.stem,
+        site_id=_crn_header_site_id(lines, id_width) or data_line_id or filepath.stem,
         site_name=metadata.get("site_name", ""),
         species=metadata.get("species", ""),
         start_year=start_year,
