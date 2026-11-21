@@ -30,7 +30,21 @@ jobs:
       - name: Unit and contract tests
         run: pytest -q
 
+      # The raw .rwl reference files are not in git; only the manifest is.
+      # The validation benchmark reads those files, so it can run only where
+      # they are present. Every other step works from the tracked manifest.
+      - name: Check for raw reference data
+        id: refdata
+        run: |
+          if find data/reference -name '*.rwl' -print -quit | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Validation benchmark skipped::No raw .rwl files under data/reference, so the leave-one-file-out validation benchmark did not run. Run it locally before a release (docs/release-checklist.md)."
+          fi
+
       - name: Validation benchmark
+        if: steps.refdata.outputs.present == 'true'
         run: python scripts/validate_crossdating.py --reference-dir data/reference --suite-file tests/fixtures/validated_northeast_v1.json
 
       - name: Walpole benchmark

@@ -274,6 +274,10 @@ python scripts/validate_crossdating.py --reference-dir data/reference --suite-fi
 python scripts/validate_crossdating.py --reference-dir data/reference --walpole-suite tests/fixtures/walpole_benchmark_v1.json
 ```
 
+GitHub Actions skips the first `validate_crossdating.py` command above. That
+benchmark reads the raw `.rwl` reference files, and those files are not in git.
+Run it locally before a release.
+
 The curated v1 benchmark suite lives at `tests/fixtures/validated_northeast_v1.json`.
 It is intentionally deterministic and represents the Northeast cases that are
 currently validated for release gating. The exploratory sampler remains
