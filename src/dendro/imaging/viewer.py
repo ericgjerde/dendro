@@ -321,7 +321,10 @@ class MeasurementViewer:
             gradient,
             min_distance=min_ring_px,
             max_distance=max(min_ring_px + 1, int(10.0 / mm_per_px)),
-            threshold=0.4,
+            # A sensitivity, not a cutoff: 0.7 gives a peak cutoff of 0.2 of the
+            # strongest boundary, the cutoff this viewer used when the argument
+            # was still a threshold (0.4 * 0.5).
+            threshold=0.7,
         )
         self.session.ring_boundaries_px = sorted(set(int(value) for value in boundaries))
         self._update_ring_display()

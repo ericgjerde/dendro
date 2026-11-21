@@ -24,6 +24,8 @@ from typing import Optional
 
 import numpy as np
 
+from .path_sampler import _directional_gradient, _smooth_profile
+
 try:
     import cv2
 except ImportError:
@@ -156,14 +158,24 @@ def detect_rings(
 
 
 def _to_uint8(gray: np.ndarray) -> np.ndarray:
-    """Safely convert 8-bit, 16-bit, or floating-point grayscale arrays to uint8."""
+    """Safely convert 8-bit, 16-bit, or floating-point grayscale arrays to uint8.
+
+    uint8 input is returned unchanged. 16-bit input is stretched by the range it
+    actually uses (0.5th to 99.5th percentile, so a few hot or dead pixels do not
+    set the scale): scanners often store 10/12/14-bit data in a 16-bit file, and
+    dropping the low byte would leave only a handful of gray levels. Float input
+    is stretched by its min/max.
+    """
     if gray.dtype == np.uint8:
         return gray
-    if gray.dtype == np.uint16:
-        return (gray >> 8).astype(np.uint8)
     g = np.asarray(gray, dtype=np.float64)
-    g_min = float(np.nanmin(g))
-    g_max = float(np.nanmax(g))
+    if gray.dtype == np.uint16:
+        g_min, g_max = (float(v) for v in np.percentile(gray, (0.5, 99.5)))
+        if g_max <= g_min:
+            g_min, g_max = float(gray.min()), float(gray.max())
+    else:
+        g_min = float(np.nanmin(g))
+        g_max = float(np.nanmax(g))
     if g_max <= g_min:
         return np.zeros(g.shape, dtype=np.uint8)
     scaled = (g - g_min) / (g_max - g_min) * 255.0
@@ -250,8 +262,8 @@ def _calculate_gradient(profile: np.ndarray) -> np.ndarray:
 
     Annual ring boundaries are sharp transitions between dark latewood and
     bright earlywood of one polarity (unlike ``abs(gradient)``, which
-    double-counts both sides of every latewood band). We choose the polarity
-    with sharper high-percentile transition peaks.
+    double-counts both sides of every latewood band). The polarity rule and the
+    edge-padded smoothing are shared with ``path_sampler``.
     """
     if len(profile) < 3:
         return np.zeros_like(profile, dtype=np.float64)
@@ -260,20 +272,7 @@ def _calculate_gradient(profile: np.ndarray) -> np.ndarray:
     if kernel_size % 2 == 0:
         kernel_size += 1
 
-    smoothed = np.convolve(
-        profile,
-        np.ones(kernel_size, dtype=np.float64) / kernel_size,
-        mode="same",
-    )
-
-    grad = np.gradient(smoothed)
-    pos = np.maximum(grad, 0.0)
-    neg = np.maximum(-grad, 0.0)
-
-    # Sharp latewood-to-earlywood boundaries concentrate gradient energy in higher peaks.
-    if float(np.percentile(neg, 98)) > float(np.percentile(pos, 98)):
-        return neg
-    return pos
+    return _directional_gradient(_smooth_profile(profile, kernel_size))
 
 
 def _find_boundaries(

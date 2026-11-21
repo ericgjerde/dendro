@@ -163,11 +163,7 @@ def profile_to_ring_positions(
     """
     from scipy.signal import find_peaks
 
-    smoothed = _smooth_profile(profile.intensities)
-    grad = np.gradient(smoothed)
-    pos = np.maximum(grad, 0.0)
-    neg = np.maximum(-grad, 0.0)
-    gradient = neg if float(np.percentile(neg, 98)) > float(np.percentile(pos, 98)) else pos
+    gradient = _directional_gradient(_smooth_profile(profile.intensities))
 
     grad_max = float(np.max(gradient)) if len(gradient) else 0.0
     if grad_max <= 0.0:
@@ -196,33 +192,49 @@ def profile_to_ring_positions(
 
 
 def _smooth_profile(profile: np.ndarray, window: int = 5) -> np.ndarray:
-    """Apply smoothing to intensity profile."""
-    if window < 3:
+    """Apply moving-average smoothing to an intensity profile.
+
+    The ends are padded with the edge values. Zero padding would pull both ends
+    toward zero and create a false gradient there that can exceed every real
+    ring boundary.
+    """
+    if window < 3 or len(profile) == 0:
         return profile
 
     kernel = np.ones(window) / window
-    return np.convolve(profile, kernel, mode='same')
+    left = window // 2
+    padded = np.pad(np.asarray(profile, dtype=np.float64), (left, window - 1 - left), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
 
-def _find_peaks(
-    signal: np.ndarray,
-    min_distance: int,
-    threshold: float,
-) -> list[int]:
-    """Find peaks in a signal."""
-    peaks = []
+def _mean_steepness(slopes: np.ndarray) -> float:
+    """Slope-weighted mean of non-negative slopes: sum(s^2) / sum(s)."""
+    total = float(np.sum(slopes))
+    if total <= 0.0:
+        return 0.0
+    return float(np.sum(slopes * slopes)) / total
 
-    for i in range(min_distance, len(signal) - min_distance):
-        # Local maximum check
-        if signal[i] < threshold:
-            continue
 
-        window = signal[max(0, i - min_distance):min(len(signal), i + min_distance + 1)]
-        if signal[i] == np.max(window):
-            if not peaks or (i - peaks[-1]) >= min_distance:
-                peaks.append(i)
+def _directional_gradient(smoothed: np.ndarray) -> np.ndarray:
+    """
+    Non-negative gradient of the polarity that carries the ring boundaries.
 
-    return peaks
+    Annual ring boundaries are sharp transitions of one polarity; the change
+    back happens gradually across the ring. ``abs(gradient)`` would count both.
+    The polarity is the one whose intensity change happens at the steeper
+    slope (slope-weighted mean slope of the rising part against the falling
+    part). That is a ratio, so it does not depend on how many samples the
+    boundaries occupy: wide rings at high resolution get the same answer as
+    narrow ones. Ties keep the rising (dark-to-bright) polarity.
+
+    Shared by ``profile_to_ring_positions`` and ``ring_detector._calculate_gradient``.
+    """
+    grad = np.gradient(smoothed)
+    pos = np.maximum(grad, 0.0)
+    neg = np.maximum(-grad, 0.0)
+    if _mean_steepness(neg) > _mean_steepness(pos):
+        return neg
+    return pos
 
 
 def manual_ring_widths(
@@ -269,6 +281,8 @@ def widths_to_tucson(
     # If any rounded measurement equals 999 (the 0.01mm stop marker), switch to
     # 0.001mm precision with -9999 stop marker so the file round-trips losslessly.
     widths_arr = np.asarray(widths_mm, dtype=np.float64)
+    if not np.all(np.isfinite(widths_arr)) or np.any(widths_arr < 0):
+        raise ValueError("Ring widths must be finite and non-negative for Tucson export")
     widths_001mm = np.rint(widths_arr * 100.0).astype(int)
     if np.any(widths_001mm == 999):
         widths_int = np.rint(widths_arr * 1000.0).astype(int)
